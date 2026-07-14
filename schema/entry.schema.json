@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geomapbench.example/schema/entry.schema.json",
+  "title": "GeoMapBench source example",
+  "type": "object",
+  "required": ["id", "leaf", "seed", "group_id", "source", "input", "target", "evaluation"],
+  "properties": {
+    "id": {"type": "string"},
+    "leaf": {"type": "string"},
+    "seed": {"type": "integer"},
+    "group_id": {"type": "string"},
+    "source": {
+      "type": "object",
+      "required": ["name", "url", "license"],
+      "properties": {
+        "name": {"type": "string"},
+        "url": {"type": "string", "format": "uri"},
+        "license": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "input": {"type": "object"},
+    "target": {"type": "object"},
+    "evaluation": {"type": "object"},
+    "attribution": {"type": "object"}
+  },
+  "additionalProperties": true
+}
+

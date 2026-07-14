@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geomapbench-data-kit"
+version = "1.0.0"
+description = "Deterministic 100-example builders for the GeoMapBench taxonomy"
+requires-python = ">=3.10"
+dependencies = [
+  "geopandas>=1.0,<2",
+  "jsonschema>=4.22,<5",
+  "matplotlib>=3.8,<4",
+  "networkx>=3.2,<4",
+  "numpy>=1.26,<3",
+  "osmnx>=2.0,<3",
+  "pandas>=2.1,<3",
+  "Pillow>=10.2,<13",
+  "pyproj>=3.6,<4",
+  "rasterio>=1.3,<2",
+  "shapely>=2.0,<3"
+]
+
+[project.scripts]
+geomapbench-data = "geomapbench_data.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["geomapbench_data*"]
+

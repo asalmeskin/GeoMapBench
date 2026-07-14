@@ -1,0 +1,25 @@
+leaf,method,source,official_url,license,exact_count,notes
+cartographic_symbol_recognition,sample,Maki,https://github.com/mapbox/maki,CC0-1.0,100,Sample SVG icons and derive human-readable POI labels
+map_text_detection_recognition_grouping,sample,Paris and Jerusalem Maps Text Dataset,https://doi.org/10.5281/zenodo.14982663,CC-BY-4.0,100,Sample valid word groups with polygons
+map_label_feature_anchoring,generate,OpenStreetMap via Overpass,https://wiki.openstreetmap.org/wiki/Overpass_API,ODbL-1.0,100,Render named feature geometries locally and retain OSM IDs
+dense_land_cover_labeling,sample,OpenEarthMap,https://doi.org/10.5281/zenodo.7223446,Source-dependent / often CC-BY-NC-SA-4.0,100,Verify per-region imagery license before redistribution
+remote_sensing_scene_classification,sample,EuroSAT RGB,https://doi.org/10.5281/zenodo.7711810,MIT plus Sentinel terms,100,Balanced ten-per-class subset
+object_presence_counting,sample,RSVQA-LR,https://doi.org/10.5281/zenodo.6344334,CC-BY-4.0 plus OSM attribution,100,Stratified over presence/count question types
+change_localization,sample+derive,SpaceNet 7,https://registry.opendata.aws/spacenet/,CC-BY-SA-4.0,100,Derive masks from tracked building IDs in adjacent months
+temporal_scene_matching,sample+derive,SpaceNet 7,https://registry.opendata.aws/spacenet/,CC-BY-SA-4.0,100,50 same-AOI and 50 different-AOI pairs
+visual_geolocation,generate,Wikimedia Commons geocoded media,https://commons.wikimedia.org/wiki/Commons:API/MediaWiki,Per-image CC0/PD/CC-BY/CC-BY-SA,100,Two licensed EXIF-stripped images around each of 50 fixed cities
+coordinate_transformation,generate,Natural Earth plus PROJ/EPSG,https://www.naturalearthdata.com/,Public domain plus PROJ terms,100,Exact pyproj reference answers
+metric_distance_computation,generate,Natural Earth populated places,https://www.naturalearthdata.com/,Public domain,100,WGS84 inverse-geodesic distances and local maps
+topological_directional_reasoning,generate,Natural Earth,https://www.naturalearthdata.com/,Public domain,100,50 within/contains and 50 direction/topology examples
+spatial_graph_construction,sample+derive,SpaceNet 3 Roads,https://registry.opendata.aws/spacenet/,CC-BY-SA-4.0,100,Convert road centerlines to graph JSON
+shortest_path_optimization,sample+derive,SpaceNet 3 Roads,https://registry.opendata.aws/spacenet/,CC-BY-SA-4.0,100,Reference NetworkX weighted shortest routes
+isochrone_service_area,generate,OpenStreetMap pedestrian networks,https://osmnx.readthedocs.io/en/stable/getting-started.html,ODbL-1.0,100,Ten origins in each of ten fixed cities at declared walking speed
+toponym_recognition,sample,GeoWebNews,https://github.com/milangritta/Pragmatic-Guide-to-Geoparsing-Evaluation,Repository GPL-3.0; verify corpus notices,100,One BRAT-annotated document per entry
+geo_entity_typing,generate,GeoNames country dumps,https://download.geonames.org/export/dump/,CC-BY-4.0,100,Balanced over nine GeoNames feature classes
+textual_spatial_relation_extraction,sample,SpaRTUN / ReSQ,https://github.com/HLR/SpaRTUN,MIT,100,Sample context-question-answer-relation records
+cross_entity_comparison,generate,World Development Indicators,https://api.worldbank.org/v2,CC-BY-4.0,100,Four fixed 2023 indicators
+environmental_layer_identification,sample+derive,1-km Köppen–Geiger maps,https://doi.org/10.5281/zenodo.5347837,CC-BY-4.0,100,Sample raster classes at Natural Earth populated places
+population_density_estimation,generate,World Development Indicators EN.POP.DNST,https://data.worldbank.org/indicator/EN.POP.DNST,CC-BY-4.0,100,Fixed reference year 2023
+geologic_geomorphic_interpretation,generate,Macrostrat API v2,https://macrostrat.org/api/v2/geologic_units/map,Underlying map licenses vary,100,Cache point-query response and source metadata
+geographic_fact_reasoning,sample,GeoQuestions1089,https://github.com/AI-team-UoA/GeoQuestions1089,CC-BY-4.0,100,Keep natural-language answer and reference GeoSPARQL query
+

@@ -1,0 +1,161 @@
+% Revised GeoMapBench geospatial task taxonomy (23 leaves)
+\documentclass{article}
+\usepackage[margin=0.7cm,landscape]{geometry}
+\usepackage{forest}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{ifthen}
+\useforestlibrary{edges}
+\pagestyle{empty}
+
+% Uses the user's icons when present and remains compilable without them.
+\newcommand{\Ticon}{%
+  \IfFileExists{text_vector.png}%
+  {\raisebox{-0.40\height}{\includegraphics[height=1.8em]{text_vector.png}}}%
+  {\raisebox{-0.15em}{\fbox{\scriptsize T}}}}
+\newcommand{\Iicon}{%
+  \IfFileExists{image_vector.png}%
+  {\raisebox{-0.40\height}{\includegraphics[height=1.8em]{image_vector.png}}}%
+  {\raisebox{-0.15em}{\fbox{\scriptsize I}}}}
+\newcommand{\TI}{\Ticon\;\Iicon}
+\newcommand{\io}[2]{\\{\scriptsize Input: #1 \quad Output: #2}}
+
+\definecolor{hidden-black}{RGB}{0,0,0}
+
+\begin{document}
+
+\begin{figure}[p]
+\centering
+\resizebox{!}{0.78\textheight}{%
+\begin{forest}
+  forked edges,
+  for tree={
+    child anchor=west,
+    parent anchor=east,
+    grow'=east,
+    anchor=west,
+    base=left,
+    rectangle,
+    draw=hidden-black,
+    rounded corners,
+    minimum height=2em,
+    minimum width=4em,
+    edge+={gray!55, line width=0.9pt},
+    s sep=2.5pt,
+    inner xsep=0.4em,
+    inner ysep=0.5em,
+    line width=0.75pt,
+    text width=11em,
+    where level=1{fill=yellow!20, font=\normalsize, text width=23em}{},
+    where level=2{fill=red!15, font=\small, text width=16em}{},
+    where level=3{fill=green!20, font=\small, text width=21em}{},
+    where level=4{fill=blue!12, font=\footnotesize, text width=18em}{},
+  },
+  [GeoMapBench Comprehensive Geospatial Task Taxonomy
+    [1. Visual Perception and Interpretation
+      [Map and Imagery Understanding
+        [Cartographic Symbol Recognition\io{\Iicon}{\Ticon}
+          [Identify the point-of-interest meaning of a cartographic symbol.]
+        ]
+        [Map Text Detection{,} Recognition{,} and Grouping\io{\Iicon}{\TI}
+          [Detect word polygons{,} transcribe text{,} and group words into map labels.]
+        ]
+        [Map Label-to-Feature Anchoring\io{\TI}{\Ticon}
+          [Associate a visible map label with the correct point{,} line{,} or polygon feature.]
+        ]
+        [Remote-Sensing Scene Classification\io{\TI}{\Ticon}
+          [Assign a scene-level land-use or land-cover class to an imagery patch.]
+        ]
+        [Object Presence and Counting\io{\TI}{\Ticon}
+          [Determine whether a geographic object is present and count visible instances.]
+        ]
+      ]
+      [Geospatial Feature Delineation
+        [Dense Land-Cover Labeling\io{\TI}{\Iicon}
+          [Assign a semantic land-cover class to every pixel or patch.]
+        ]
+      ]
+      [Spatiotemporal Visual Comparison
+        [Change Localization\io{\TI}{\TI}
+          [Localize object-level or pixel-level change between aligned observations.]
+        ]
+        [Temporal Scene Matching\io{\TI}{\Ticon}
+          [Decide whether two observations show the same geographic area across time.]
+        ]
+      ]
+      [Image-to-Location Grounding
+        [Visual Geolocation\io{\Iicon}{\Ticon}
+          [Infer city{,} country{,} and approximate coordinates from visual geographic cues.]
+        ]
+      ]
+    ]
+    [2. Spatial Reasoning and Geometric Processing
+      [Coordinate and Reference-Frame Handling
+        [Coordinate Transformation\io{\Ticon}{\Ticon}
+          [Convert coordinates between declared coordinate reference systems.]
+        ]
+      ]
+      [Spatial Relationship Reasoning
+        [Metric Distance Computation\io{\TI}{\Ticon}
+          [Compute geodesic or geometry-aware distances between spatial entities.]
+        ]
+        [Topological and Directional Reasoning\io{\TI}{\Ticon}
+          [Infer within{,} contains{,} touches{,} and relative cardinal direction relations.]
+        ]
+      ]
+      [Network and Route Analysis
+        [Spatial Graph Construction\io{\TI}{\Ticon}
+          [Convert road or path centerlines into a connected{,} weighted routable graph.]
+        ]
+        [Shortest-Path Optimization\io{\TI}{\TI}
+          [Return a valid least-cost path under a declared edge-cost function.]
+        ]
+        [Isochrone / Service-Area Computation\io{\TI}{\TI}
+          [Return the area reachable from an origin within a time or distance budget.]
+        ]
+      ]
+    ]
+    [3. Semantic Interpretation and Analytical Reasoning
+      [Geo-Semantics and Grounding
+        [Toponym Recognition\io{\Ticon}{\Ticon}
+          [Detect place-name mentions and their exact spans in natural-language text.]
+        ]
+        [Geo-Entity Typing\io{\Ticon}{\Ticon}
+          [Classify a geographic mention as a populated place{,} water body{,} terrain{,} route{,} etc.]
+        ]
+        [Textual Spatial-Relation Extraction\io{\Ticon}{\Ticon}
+          [Extract explicit or inferred relations such as north of{,} inside{,} near{,} or touching.]
+        ]
+      ]
+      [Comparative and Explanatory Geospatial Reasoning
+        [Cross-Entity Comparison\io{\Ticon}{\Ticon}
+          [Compare two locations or regions using a declared metric{,} year{,} and unit.]
+        ]
+      ]
+    ]
+    [4. Spatial Intelligence Tools Suite
+      [Socioeconomic and Environmental Inference
+        [Environmental Layer Identification\io{\Ticon}{\Ticon}
+          [Identify a climate{,} biome{,} or ecoregion category at a specified location.]
+        ]
+        [Population and Density Estimation\io{\Ticon}{\Ticon}
+          [Retrieve or aggregate population density for a specified region and year.]
+        ]
+      ]
+      [Geoscience Knowledge Reasoning
+        [Geologic / Geomorphic Interpretation\io{\Ticon}{\Ticon}
+          [Identify and interpret mapped lithology{,} stratigraphic age{,} or landform information.]
+        ]
+        [Geographic Fact Reasoning\io{\Ticon}{\Ticon}
+          [Answer geographic questions requiring spatial relations and structured world knowledge.]
+        ]
+      ]
+    ]
+  ]
+\end{forest}%
+}
+\caption{Revised GeoMapBench taxonomy. Text/coordinates/serialized vectors are represented by T; raster imagery and rendered maps by I. The former map-text leaf is split into measurable text-grouping and feature-anchoring tasks; scene classification, object presence/counting, and visual geolocation are added.}
+\label{fig:geomapbench_taxonomy_revised}
+\end{figure}
+
+\end{document}
