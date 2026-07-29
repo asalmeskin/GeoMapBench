@@ -45,45 +45,132 @@ def _country_name(row) -> str:
     return "unknown country"
 
 
-def generate_coordinate_transform(cache: Path, output: Path) -> Path:
+def _utm_epsg(longitude: float, latitude: float) -> int:
+    zone = max(1, min(60, int((longitude + 180) // 6) + 1))
+    return (32600 if latitude >= 0 else 32700) + zone
+
+
+def _coordinate_case(longitude: float, latitude: float, mode: str) -> dict[str, Any]:
+    """Build one reversible coordinate-transformation case."""
     from pyproj import Transformer
 
+    utm = f"EPSG:{_utm_epsg(longitude, latitude)}"
+    definitions = {
+        "geographic_to_utm": ("EPSG:4326", utm, "longitude", "latitude", "easting", "northing", "degrees", "metres"),
+        "utm_to_geographic": (utm, "EPSG:4326", "easting", "northing", "longitude", "latitude", "metres", "degrees"),
+        "geographic_to_web_mercator": ("EPSG:4326", "EPSG:3857", "longitude", "latitude", "x", "y", "degrees", "metres"),
+        "web_mercator_to_geographic": ("EPSG:3857", "EPSG:4326", "x", "y", "longitude", "latitude", "metres", "degrees"),
+        "utm_to_web_mercator": (utm, "EPSG:3857", "easting", "northing", "x", "y", "metres", "metres"),
+        "web_mercator_to_utm": ("EPSG:3857", utm, "x", "y", "easting", "northing", "metres", "metres"),
+    }
+    if mode not in definitions:
+        raise ValueError(f"Unknown coordinate-transformation mode: {mode}")
+
+    source_crs, target_crs, source_x_name, source_y_name, target_x_name, target_y_name, source_unit, target_unit = definitions[mode]
+    wgs84_to_source = Transformer.from_crs("EPSG:4326", source_crs, always_xy=True)
+    source_x, source_y = wgs84_to_source.transform(longitude, latitude)
+    transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
+    target_x, target_y = transformer.transform(source_x, source_y)
+    inverse = Transformer.from_crs(target_crs, source_crs, always_xy=True)
+    roundtrip_x, roundtrip_y = inverse.transform(target_x, target_y)
+
+    projected = target_unit == "metres"
+    precision = 3 if projected else 7
+    tolerance = 1.0 if projected else 1e-5
+    return {
+        "mode": mode,
+        "source_crs": source_crs,
+        "target_crs": target_crs,
+        "source": {
+            source_x_name: round(float(source_x), 7 if source_unit == "degrees" else 3),
+            source_y_name: round(float(source_y), 7 if source_unit == "degrees" else 3),
+            "axis_order": [source_x_name, source_y_name],
+            "unit": source_unit,
+        },
+        "target": {
+            target_x_name: round(float(target_x), precision),
+            target_y_name: round(float(target_y), precision),
+            "axis_order": [target_x_name, target_y_name],
+            "unit": target_unit,
+        },
+        "roundtrip_error": max(abs(roundtrip_x - source_x), abs(roundtrip_y - source_y)),
+        "absolute_tolerance": tolerance,
+    }
+
+
+def generate_coordinate_transform(cache: Path, output: Path) -> Path:
     leaf = "coordinate_transformation"
     _, places = natural_earth(cache)
-    candidates = [row for _, row in places.iterrows() if row.geometry and not row.geometry.is_empty and abs(row.geometry.y) < 80]
-    selected = stable_sample(candidates, N_EXAMPLES, SEEDS[leaf], key=lambda row: f"{_place_name(row)}:{row.geometry.x:.6f}")
+    candidates = [
+        row
+        for _, row in places.iterrows()
+        if row.geometry and not row.geometry.is_empty and abs(row.geometry.y) < 80
+    ]
+    selected = stable_sample(
+        candidates,
+        N_EXAMPLES,
+        SEEDS[leaf],
+        key=lambda row: f"{_place_name(row)}:{row.geometry.x:.6f}:{row.geometry.y:.6f}",
+    )
+    modes = (
+        "geographic_to_utm",
+        "utm_to_geographic",
+        "geographic_to_web_mercator",
+        "web_mercator_to_geographic",
+        "utm_to_web_mercator",
+        "web_mercator_to_utm",
+    )
     records: list[dict[str, Any]] = []
     for i, row in enumerate(selected):
         lon, lat = float(row.geometry.x), float(row.geometry.y)
-        zone = int((lon + 180) // 6) + 1
-        target_epsg = (32600 if lat >= 0 else 32700) + zone
-        transformer = Transformer.from_crs(4326, target_epsg, always_xy=True)
-        easting, northing = transformer.transform(lon, lat)
+        case = _coordinate_case(lon, lat, modes[i % len(modes)])
+        source = case["source"]
+        source_values = [source[name] for name in source["axis_order"]]
+        target_axes = case["target"]["axis_order"]
+        question = (
+            f"Transform the coordinate ({source_values[0]}, {source_values[1]}) from "
+            f"{case['source_crs']} to {case['target_crs']}. Interpret the input in "
+            f"{source['axis_order'][0]}-then-{source['axis_order'][1]} order and return "
+            f"{target_axes[0]} and {target_axes[1]} in {case['target']['unit']}."
+        )
         record = base_record(
             leaf,
             i,
             "Natural Earth populated places + PROJ/EPSG",
             "https://www.naturalearthdata.com/",
             "Natural Earth public domain; PROJ data terms apply",
-            _place_name(row),
+            f"{_place_name(row)}:{case['mode']}",
         )
         record.update(
             {
                 "input": {
-                    "question": f"Transform WGS 84 longitude {lon:.6f}, latitude {lat:.6f} to EPSG:{target_epsg}.",
-                    "coordinate": {"crs": "EPSG:4326", "longitude": lon, "latitude": lat},
-                    "target_crs": f"EPSG:{target_epsg}",
+                    "question": question,
+                    "transformation_mode": case["mode"],
+                    "source_crs": case["source_crs"],
+                    "target_crs": case["target_crs"],
+                    "coordinate": source,
+                    "reference_place": _place_name(row),
                 },
                 "target": {
-                    "easting_m": round(easting, 3),
-                    "northing_m": round(northing, 3),
-                    "crs": f"EPSG:{target_epsg}",
+                    **case["target"],
+                    "crs": case["target_crs"],
                 },
-                "evaluation": {"type": "numeric", "absolute_tolerance_m": 1.0},
+                "evaluation": {
+                    "type": "numeric_coordinate_pair",
+                    "absolute_tolerance": case["absolute_tolerance"],
+                    "unit": case["target"]["unit"],
+                },
             }
         )
+        if case["roundtrip_error"] > 1e-5:
+            raise ValueError(f"Unstable CRS round trip for {_place_name(row)}: {case}")
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"transformation_modes": list(modes), "crs_pair_count": len({(r['input']['source_crs'], r['input']['target_crs']) for r in records})},
+    )
 
 
 def _render_world_pair(countries, first, second, destination: Path, first_label: str, second_label: str) -> None:
@@ -288,16 +375,25 @@ def generate_geo_entity_typing(cache: Path, output: Path) -> Path:
             with zipfile.ZipFile(archive) as zf:
                 zf.extractall(target)
             marker.write_text("ok\n", encoding="utf-8")
-        txt = next(target.glob("*.txt"))
+        txt = target / f"{code}.txt"
+        if not txt.is_file():
+            candidates = [path for path in target.glob("*.txt") if path.name.lower() != "readme.txt"]
+            if len(candidates) != 1:
+                raise FileNotFoundError(f"Could not identify GeoNames data file for {code}: {candidates}")
+            txt = candidates[0]
         all_rows.extend(_parse_geonames(txt))
+
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in all_rows:
         groups[row["feature_class"]].append(row)
     selected = balanced_sample(groups, N_EXAMPLES, SEEDS[leaf], key=lambda x: f"{x['id']}:{x['name']}")
-    choices = [GEONAMES_CLASS_NAMES[k] for k in sorted(GEONAMES_CLASS_NAMES)]
+    ontology = {code: GEONAMES_CLASS_NAMES[code] for code in sorted(GEONAMES_CLASS_NAMES)}
+    choices = [f"{code} — {ontology[code]}" for code in ontology]
+    legend = "; ".join(choices)
     records: list[dict[str, Any]] = []
     for i, (_, item) in enumerate(selected):
-        answer = GEONAMES_CLASS_NAMES[item["feature_class"]]
+        code = item["feature_class"]
+        answer = f"{code} — {ontology[code]}"
         record = base_record(
             leaf,
             i,
@@ -309,70 +405,225 @@ def generate_geo_entity_typing(cache: Path, output: Path) -> Path:
         record.update(
             {
                 "input": {
-                    "question": f"What geographic entity type is the place name “{item['name']}”?",
+                    "question": (
+                        f"Classify the geographic entity “{item['name']}” using exactly one GeoNames "
+                        f"feature class. Closed-set legend: {legend}."
+                    ),
                     "mention": item["name"],
-                    "context": {"country_code": item["country_code"], "latitude": item["latitude"], "longitude": item["longitude"]},
+                    "context": {
+                        "country_code": item["country_code"],
+                        "latitude": item["latitude"],
+                        "longitude": item["longitude"],
+                    },
+                    "ontology": ontology,
                     "choices": choices,
                 },
                 "target": {
                     "answer": answer,
-                    "feature_class": item["feature_class"],
+                    "feature_class": code,
+                    "feature_class_name": ontology[code],
                     "feature_code": item["feature_code"],
+                    "choice_index": choices.index(answer),
                 },
-                "evaluation": {"type": "classification", "metric": "macro_f1"},
+                "evaluation": {"type": "classification", "metrics": ["accuracy", "macro_f1"]},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(output, leaf, records, {"ontology": ontology})
 
 
-KOPPEN_CLASSES = {
-    1: "Af", 2: "Am", 3: "Aw", 4: "BWh", 5: "BWk", 6: "BSh", 7: "BSk",
-    8: "Csa", 9: "Csb", 10: "Csc", 11: "Cwa", 12: "Cwb", 13: "Cwc",
-    14: "Cfa", 15: "Cfb", 16: "Cfc", 17: "Dsa", 18: "Dsb", 19: "Dsc",
-    20: "Dsd", 21: "Dwa", 22: "Dwb", 23: "Dwc", 24: "Dwd", 25: "Dfa",
-    26: "Dfb", 27: "Dfc", 28: "Dfd", 29: "ET", 30: "EF",
+WORLDCLIM_BASE_URL = "https://geodata.ucdavis.edu/climate/worldclim/2_1/base"
+ENVIRONMENTAL_LAYERS = {
+    "elevation": {
+        "label": "elevation",
+        "archive": "wc2.1_10m_elev.zip",
+        "file": "wc2.1_10m_elev.tif",
+        "unit": "metres above sea level",
+        "scale": 1.0,
+    },
+    "annual_mean_temperature": {
+        "label": "annual mean temperature",
+        "archive": "wc2.1_10m_bio.zip",
+        "file": "wc2.1_10m_bio_1.tif",
+        "unit": "degrees Celsius",
+        "scale": 0.1,
+    },
+    "annual_temperature_range": {
+        "label": "annual temperature range",
+        "archive": "wc2.1_10m_bio.zip",
+        "file": "wc2.1_10m_bio_7.tif",
+        "unit": "degrees Celsius",
+        "scale": 0.1,
+    },
+    "temperature_seasonality": {
+        "label": "temperature seasonality",
+        "archive": "wc2.1_10m_bio.zip",
+        "file": "wc2.1_10m_bio_4.tif",
+        "unit": "standard-deviation index × 100",
+        "scale": 1.0,
+    },
+    "annual_precipitation": {
+        "label": "annual precipitation",
+        "archive": "wc2.1_10m_bio.zip",
+        "file": "wc2.1_10m_bio_12.tif",
+        "unit": "millimetres",
+        "scale": 1.0,
+    },
+    "precipitation_seasonality": {
+        "label": "precipitation seasonality",
+        "archive": "wc2.1_10m_bio.zip",
+        "file": "wc2.1_10m_bio_15.tif",
+        "unit": "coefficient of variation",
+        "scale": 1.0,
+    },
 }
 
 
-def generate_environmental_layer(cache: Path, koppen_raster: Path, output: Path) -> Path:
+def _worldclim_layer_paths(cache: Path) -> dict[str, Path]:
+    root = cache / "worldclim_2_1_10m"
+    extracted: dict[str, Path] = {}
+    for archive_name in sorted({spec["archive"] for spec in ENVIRONMENTAL_LAYERS.values()}):
+        archive = download(f"{WORLDCLIM_BASE_URL}/{archive_name}", root / archive_name)
+        extracted[archive_name] = extract_zip(archive, root / archive_name.removesuffix(".zip"))
+    paths: dict[str, Path] = {}
+    for layer_id, spec in ENVIRONMENTAL_LAYERS.items():
+        matches = list(extracted[spec["archive"]].rglob(spec["file"]))
+        if len(matches) != 1:
+            raise FileNotFoundError(f"Expected one {spec['file']}, found {matches}")
+        paths[layer_id] = matches[0]
+    return paths
+
+
+def _read_environmental_patch(path: Path, longitude: float, latitude: float, scale: float):
+    import numpy as np
     import rasterio
     from pyproj import Transformer
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds
 
+    half_width = 4.0
+    with rasterio.open(path) as src:
+        transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
+        left, bottom = transformer.transform(longitude - half_width, latitude - half_width)
+        right, top = transformer.transform(longitude + half_width, latitude + half_width)
+        window = from_bounds(left, bottom, right, top, transform=src.transform)
+        patch = src.read(
+            1,
+            window=window,
+            out_shape=(128, 128),
+            boundless=True,
+            masked=True,
+            resampling=Resampling.bilinear,
+        ).astype("float64")
+    patch *= float(scale)
+    compressed = patch.compressed()
+    if compressed.size < patch.size * 0.65:
+        raise ValueError(f"Too little valid raster coverage around {latitude}, {longitude}")
+    if not np.isfinite(compressed).all():
+        raise ValueError("Non-finite environmental raster values")
+    return patch
+
+
+def _render_environmental_patch(patch, destination: Path) -> dict[str, float]:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    values = patch.compressed()
+    low, high = np.percentile(values, [2, 98])
+    if not np.isfinite(low) or not np.isfinite(high) or low == high:
+        low, high = float(values.min()), float(values.max() + 1e-6)
+    fig, ax = plt.subplots(figsize=(5.0, 4.3), dpi=130)
+    image = ax.imshow(patch, cmap="viridis", vmin=low, vmax=high, interpolation="bilinear")
+    ax.set_axis_off()
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.046, pad=0.025)
+    colorbar.ax.set_ylabel("Raster value", rotation=270, labelpad=13)
+    fig.tight_layout(pad=0.15)
+    fig.savefig(destination, bbox_inches="tight")
+    plt.close(fig)
+    return {
+        "minimum": round(float(values.min()), 4),
+        "maximum": round(float(values.max()), 4),
+        "mean": round(float(values.mean()), 4),
+        "standard_deviation": round(float(values.std()), 4),
+    }
+
+
+def generate_environmental_layer(cache: Path, koppen_raster: Path | None, output: Path) -> Path:
+    """Build a balanced multi-layer identification task.
+
+    ``koppen_raster`` is retained as a deprecated positional argument for CLI/API
+    compatibility. The revised task uses six official WorldClim layers so the
+    target is no longer constant.
+    """
     leaf = "environmental_layer_identification"
     _, places = natural_earth(cache)
-    rows = [row for _, row in places.iterrows() if row.geometry and not row.geometry.is_empty]
-    candidates: list[tuple[Any, int]] = []
-    with rasterio.open(koppen_raster) as src:
-        transformer = Transformer.from_crs(4326, src.crs, always_xy=True)
-        for row in rows:
-            x, y = transformer.transform(row.geometry.x, row.geometry.y)
-            value = int(next(src.sample([(x, y)]))[0])
-            if value in KOPPEN_CLASSES:
-                candidates.append((row, value))
-    selected = stable_sample(candidates, N_EXAMPLES, SEEDS[leaf], key=lambda x: f"{_place_name(x[0])}:{x[1]}")
+    rows = [
+        row
+        for _, row in places.iterrows()
+        if row.geometry and not row.geometry.is_empty and abs(float(row.geometry.y)) <= 70
+    ]
+    layer_paths = _worldclim_layer_paths(cache)
+    groups = {layer_id: rows for layer_id in ENVIRONMENTAL_LAYERS}
+    selected = balanced_sample(
+        groups,
+        N_EXAMPLES,
+        SEEDS[leaf],
+        key=lambda row: f"{_place_name(row)}:{row.geometry.x:.5f}:{row.geometry.y:.5f}",
+    )
+    choices = [ENVIRONMENTAL_LAYERS[layer_id]["label"] for layer_id in sorted(ENVIRONMENTAL_LAYERS)]
+    templates = (
+        "Which environmental variable is represented by this raster patch around {place}?",
+        "Identify the environmental layer visualized for the region centred on {place}.",
+        "What type of environmental raster is shown near {place}?",
+        "Select the variable mapped in this unlabeled raster around {place}.",
+    )
+    task_dir = output / leaf
     records: list[dict[str, Any]] = []
-    for i, (row, value) in enumerate(selected):
-        code = KOPPEN_CLASSES[value]
-        name = _place_name(row)
+    for i, (layer_id, row) in enumerate(selected):
+        spec = ENVIRONMENTAL_LAYERS[layer_id]
+        lon, lat = float(row.geometry.x), float(row.geometry.y)
+        patch = _read_environmental_patch(layer_paths[layer_id], lon, lat, spec["scale"])
+        image_path = task_dir / "assets" / f"{i:03d}_{layer_id}.png"
+        statistics = _render_environmental_patch(patch, image_path)
+        place = _place_name(row)
+        answer = spec["label"]
         record = base_record(
             leaf,
             i,
-            "1-km Köppen–Geiger climate classification",
-            "https://doi.org/10.5281/zenodo.5347837",
-            "CC-BY-4.0",
-            name,
+            "WorldClim 2.1 global climate and elevation rasters",
+            "https://www.worldclim.org/data/worldclim21.html",
+            "WorldClim data license; free for research and related activities",
+            f"{layer_id}:{place}",
         )
         record.update(
             {
                 "input": {
-                    "question": f"What Köppen–Geiger climate class occurs at {name} ({row.geometry.y:.5f}, {row.geometry.x:.5f})?",
-                    "coordinate": {"longitude": row.geometry.x, "latitude": row.geometry.y, "crs": "EPSG:4326"},
+                    "images": [image_path.relative_to(task_dir).as_posix()],
+                    "question": templates[i % len(templates)].format(place=place),
+                    "choices": choices,
+                    "coordinate": {"longitude": lon, "latitude": lat, "crs": "EPSG:4326"},
+                    "note": "The colorbar is intentionally unlabeled; infer the layer from its values and spatial pattern.",
                 },
-                "target": {"class_code": code, "raster_value": value},
-                "evaluation": {"type": "classification", "metric": "accuracy"},
+                "target": {
+                    "answer": answer,
+                    "choice_index": choices.index(answer),
+                    "layer_id": layer_id,
+                    "unit": spec["unit"],
+                    "summary_statistics": statistics,
+                },
+                "evaluation": {"type": "classification", "metrics": ["accuracy", "macro_f1"]},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records, {"source_raster_sha256_note": "Recorded by the release pipeline"})
+    distribution = {layer_id: sum(r["target"]["layer_id"] == layer_id for r in records) for layer_id in ENVIRONMENTAL_LAYERS}
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"layer_distribution": distribution, "deprecated_koppen_argument_used": koppen_raster is not None},
+    )
 

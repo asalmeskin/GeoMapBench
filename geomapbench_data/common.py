@@ -10,6 +10,7 @@ from typing import Any, Iterable, Sequence, TypeVar
 
 
 N_EXAMPLES = 100
+DATA_REVISION = "2026-07-comments-v2"
 
 # Every leaf has its own fixed seed. Keep these values immutable after a public
 # benchmark release. Changing a seed creates a new benchmark version.
@@ -147,6 +148,7 @@ def finalize_task(
         "leaf": leaf,
         "count": len(records),
         "seed": SEEDS[leaf],
+        "data_revision": DATA_REVISION,
         "created_at": utc_now(),
         "data_file": dataset_path.name,
         "sha256": sha256_file(dataset_path),

@@ -4,7 +4,19 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from .common import N_EXAMPLES, SEEDS, read_jsonl, sha256_file
+from .common import DATA_REVISION, N_EXAMPLES, SEEDS, read_jsonl, sha256_file
+
+
+REVISED_TASKS = {
+    "coordinate_transformation",
+    "cross_entity_comparison",
+    "dense_land_cover_labeling",
+    "environmental_layer_identification",
+    "geo_entity_typing",
+    "isochrone_service_area",
+    "map_label_feature_anchoring",
+    "map_text_detection_recognition_grouping",
+}
 
 
 def _asset_strings(obj: Any, parent_key: str = "") -> Iterable[str]:
@@ -34,6 +46,11 @@ def validate_task(task_dir: Path, require_assets: bool = True) -> list[str]:
         errors.append(f"{task_dir.name}: checksum mismatch")
     if manifest.get("seed") != SEEDS.get(task_dir.name):
         errors.append(f"{task_dir.name}: unexpected seed")
+    if task_dir.name in REVISED_TASKS and manifest.get("data_revision") != DATA_REVISION:
+        errors.append(
+            f"{task_dir.name}: expected data_revision {DATA_REVISION}, "
+            f"found {manifest.get('data_revision')}"
+        )
     ids: set[str] = set()
     for line_number, record in enumerate(records, 1):
         for field in ("id", "leaf", "seed", "group_id", "source", "input", "target", "evaluation"):
@@ -53,6 +70,98 @@ def validate_task(task_dir: Path, require_assets: bool = True) -> list[str]:
                     errors.append(f"{task_dir.name}:{line_number}: unsafe asset path {asset}")
                 elif not candidate.exists():
                     errors.append(f"{task_dir.name}:{line_number}: missing asset {asset}")
+    errors.extend(_validate_revised_content(task_dir, records))
+    return errors
+
+
+def _validate_revised_content(task_dir: Path, records: list[dict[str, Any]]) -> list[str]:
+    name = task_dir.name
+    if name not in REVISED_TASKS or not records:
+        return []
+    errors: list[str] = []
+
+    if name == "coordinate_transformation":
+        modes = {record.get("input", {}).get("transformation_mode") for record in records}
+        pairs = {
+            (record.get("input", {}).get("source_crs"), record.get("input", {}).get("target_crs"))
+            for record in records
+        }
+        if len(modes) < 6:
+            errors.append(f"{name}: only {len(modes)} transformation modes")
+        if len(pairs) < 8:
+            errors.append(f"{name}: only {len(pairs)} source/target CRS pairs")
+
+    elif name == "cross_entity_comparison":
+        years = {record.get("target", {}).get("year") for record in records}
+        indicators = {record.get("target", {}).get("indicator") for record in records}
+        directions = {record.get("target", {}).get("relation") for record in records}
+        if len(years) < 5:
+            errors.append(f"{name}: insufficient year diversity: {sorted(years)}")
+        if len(indicators) < 4:
+            errors.append(f"{name}: insufficient indicator diversity: {sorted(indicators)}")
+        if directions != {"higher", "lower"}:
+            errors.append(f"{name}: expected higher and lower comparisons, found {sorted(directions)}")
+
+    elif name == "environmental_layer_identification":
+        answers = {record.get("target", {}).get("layer_id") for record in records}
+        if len(answers) < 5:
+            errors.append(f"{name}: target is still degenerate: {sorted(answers)}")
+
+    elif name == "geo_entity_typing":
+        ontology = records[0].get("input", {}).get("ontology", {})
+        if set(ontology) != {"A", "H", "L", "P", "R", "S", "T", "U", "V"}:
+            errors.append(f"{name}: incomplete GeoNames ontology")
+
+    elif name == "isochrone_service_area":
+        cities = {record.get("input", {}).get("city") for record in records}
+        speeds = {record.get("input", {}).get("speed_mps") for record in records}
+        budgets = {record.get("input", {}).get("budget_minutes") for record in records}
+        methods = {record.get("target", {}).get("construction_method") for record in records}
+        if len(cities) < 15:
+            errors.append(f"{name}: only {len(cities)} cities")
+        if len(speeds) < 5 or len(budgets) < 4:
+            errors.append(f"{name}: insufficient speed/budget diversity")
+        if methods != {"buffered reachable street edges in a local projected CRS"}:
+            errors.append(f"{name}: unexpected polygon construction methods: {methods}")
+
+    elif name == "map_label_feature_anchoring":
+        if any("label_anchor" not in record.get("target", {}) for record in records):
+            errors.append(f"{name}: missing label-anchor coordinates")
+        if any(record.get("input", {}).get("task_definition") != "text-to-geographic-feature grounding" for record in records):
+            errors.append(f"{name}: unclear task definition")
+
+    elif name == "map_text_detection_recognition_grouping":
+        for index, record in enumerate(records, 1):
+            groups = record.get("target", {}).get("groups", [])
+            if len(groups) < 2:
+                errors.append(f"{name}:{index}: fewer than two label groups")
+                break
+            if any(not group.get("group_id") or not group.get("words") for group in groups):
+                errors.append(f"{name}:{index}: malformed group annotations")
+                break
+
+    elif name == "dense_land_cover_labeling":
+        try:
+            import numpy as np
+            from PIL import Image
+        except ImportError as error:
+            errors.append(f"{name}: cannot validate masks: {error}")
+            return errors
+        allowed = set(range(8)) | {255}
+        for index, record in enumerate(records, 1):
+            image_path = task_dir / record["input"]["images"][0]
+            mask_path = task_dir / record["target"]["mask"]
+            with Image.open(image_path) as image, Image.open(mask_path) as mask:
+                if image.size != mask.size:
+                    errors.append(f"{name}:{index}: image/mask size mismatch")
+                    break
+                values = set(int(value) for value in np.unique(np.asarray(mask)))
+                if not values.issubset(allowed):
+                    errors.append(f"{name}:{index}: invalid mask IDs {sorted(values - allowed)}")
+                    break
+                if mask.mode != "L":
+                    errors.append(f"{name}:{index}: mask must be single-channel L mode, found {mask.mode}")
+                    break
     return errors
 
 

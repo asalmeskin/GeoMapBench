@@ -73,11 +73,116 @@ def _find_by_basename(root: Path) -> dict[str, Path]:
     return out
 
 
+def _normalize_vertices(value: Any) -> list[list[float]]:
+    if not isinstance(value, list):
+        return []
+    points: list[list[float]] = []
+    for point in value:
+        if isinstance(point, dict) and "x" in point and "y" in point:
+            points.append([float(point["x"]), float(point["y"])])
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            points.append([float(point[0]), float(point[1])])
+    return points if len(points) >= 3 else []
+
+
+def _annotation_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _valid_maptext_word(word: Any) -> dict[str, Any] | None:
+    if not isinstance(word, dict):
+        return None
+    text = str(word.get("text", "")).strip()
+    vertices = _normalize_vertices(
+        word.get("vertices") or word.get("polygon") or word.get("points")
+    )
+    if (
+        not text
+        or not vertices
+        or _annotation_flag(word.get("illegible", False))
+        or _annotation_flag(word.get("truncated", False))
+    ):
+        return None
+    return {"text": text, "vertices": vertices}
+
+
+def _sequence_from_words(words: list[Any], source_group_index: Any) -> dict[str, Any] | None:
+    valid_words = [parsed for word in words if (parsed := _valid_maptext_word(word))]
+    if not valid_words:
+        return None
+    xs = [point[0] for word in valid_words for point in word["vertices"]]
+    ys = [point[1] for word in valid_words for point in word["vertices"]]
+    return {
+        "source_group_index": str(source_group_index),
+        "text": " ".join(word["text"] for word in valid_words),
+        "words": valid_words,
+        "bbox": [min(xs), min(ys), max(xs), max(ys)],
+    }
+
+
+def _maptext_sequences(image_record: dict[str, Any]) -> list[dict[str, Any]]:
+    """Parse MapText sequence annotations without splitting multiword labels.
+
+    The official release and related ICDAR exports occur in several equivalent
+    layouts: a sequence can be a list of word dictionaries, a dictionary with a
+    ``words`` list, or an image/sequence record whose entire ``groups`` list is
+    the ordered word sequence. Explicit sequence/group IDs are also supported.
+    """
+    raw_groups = image_record.get("groups") or image_record.get("annotations") or []
+    if not isinstance(raw_groups, list) or not raw_groups:
+        return []
+
+    # Flat word dictionaries may carry explicit sequence identifiers.
+    if all(isinstance(item, dict) and not isinstance(item.get("words"), list) for item in raw_groups):
+        id_keys = ("sequence_id", "group_id", "line_id", "sequence", "group")
+        explicit_ids = []
+        for item in raw_groups:
+            explicit_ids.append(next((item.get(key) for key in id_keys if item.get(key) is not None), None))
+        if any(value is not None and not isinstance(value, (dict, list)) for value in explicit_ids):
+            ordered: dict[str, list[Any]] = {}
+            for position, (item, identifier) in enumerate(zip(raw_groups, explicit_ids)):
+                key = str(identifier if identifier is not None else f"ungrouped-{position}")
+                ordered.setdefault(key, []).append(item)
+            return [
+                sequence
+                for key, words in ordered.items()
+                if (sequence := _sequence_from_words(words, key)) is not None
+            ]
+
+        # In the official flat layout, all dictionaries in one record are the
+        # ordered words of one sequence (single-word records are valid too).
+        sequence = _sequence_from_words(raw_groups, image_record.get("sequence_id", 0))
+        return [sequence] if sequence else []
+
+    sequences: list[dict[str, Any]] = []
+    for group_index, group in enumerate(raw_groups):
+        words: list[Any]
+        if isinstance(group, list):
+            words = group
+        elif isinstance(group, dict) and isinstance(group.get("words"), list):
+            words = group["words"]
+        elif isinstance(group, dict) and isinstance(group.get("tokens"), list):
+            words = group["tokens"]
+        elif isinstance(group, dict):
+            words = [group]
+        else:
+            continue
+        sequence = _sequence_from_words(words, group_index)
+        if sequence:
+            sequences.append(sequence)
+    return sequences
+
+
 def _maptext_candidates(data: Any, image_lookup: dict[str, Path]) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
     image_records = data if isinstance(data, list) else data.get("images", data.get("data", []))
     if not isinstance(image_records, list):
-        raise ValueError("MapText JSON must contain a list of image records")
+        raise ValueError("MapText JSON must contain a list of image or sequence records")
+
+    # Aggregate every sequence belonging to the same source image. This handles
+    # releases with one record per image as well as one record per sequence.
+    by_image: dict[str, dict[str, Any]] = {}
     for image_index, image_record in enumerate(image_records):
         if not isinstance(image_record, dict):
             continue
@@ -90,44 +195,95 @@ def _maptext_candidates(data: Any, image_lookup: dict[str, Path]) -> list[dict[s
         image_path = image_lookup.get(image_name) or image_lookup.get(Path(image_name).stem)
         if image_path is None:
             continue
-        groups = image_record.get("groups") or image_record.get("annotations") or []
-        for group_index, group in enumerate(groups):
-            words: list[dict[str, Any]]
-            if isinstance(group, list):
-                words = [x for x in group if isinstance(x, dict)]
-            elif isinstance(group, dict) and isinstance(group.get("words"), list):
-                words = [x for x in group["words"] if isinstance(x, dict)]
-            elif isinstance(group, dict):
-                words = [group]
-            else:
-                continue
-            valid = [
-                w
-                for w in words
-                if str(w.get("text", "")).strip()
-                and not bool(w.get("illegible", False))
-                and not bool(w.get("truncated", False))
-            ]
-            if not valid:
-                continue
-            text = " ".join(str(w["text"]).strip() for w in valid)
+        bucket = by_image.setdefault(
+            image_name or str(image_index),
+            {"image": image_path, "image_name": image_name, "sequences": []},
+        )
+        for sequence in _maptext_sequences(image_record):
+            sequence = dict(sequence)
+            sequence["source_group_index"] = (
+                f"{image_index}:{sequence['source_group_index']}"
+            )
+            bucket["sequences"].append(sequence)
+
+    candidates: list[dict[str, Any]] = []
+    for image_group, bucket in sorted(by_image.items()):
+        sequences = bucket["sequences"]
+        if len(sequences) < 2:
+            continue
+        for anchor_index, sequence in enumerate(sequences):
             candidates.append(
                 {
-                    "key": f"{image_name}:{group_index}:{text}",
-                    "image": image_path,
-                    "image_name": image_name,
-                    "text": text,
-                    "words": [
-                        {
-                            "text": str(w["text"]).strip(),
-                            "vertices": w.get("vertices") or w.get("polygon") or w.get("points"),
-                        }
-                        for w in valid
-                    ],
-                    "image_group": image_name or str(image_index),
+                    "key": f"{image_group}:{sequence['source_group_index']}:{sequence['text']}",
+                    "image": bucket["image"],
+                    "image_name": bucket["image_name"],
+                    "groups": sequences,
+                    "anchor_index": anchor_index,
+                    "image_group": image_group,
                 }
             )
     return candidates
+
+def _crop_maptext_example(item: dict[str, Any], destination: Path) -> list[dict[str, Any]]:
+    from PIL import Image
+
+    with Image.open(item["image"]) as source:
+        image = source.convert("RGB")
+        width, height = image.size
+        anchor = item["groups"][item["anchor_index"]]
+        x0, y0, x1, y1 = anchor["bbox"]
+        center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+        side = int(max(512, min(1400, max(x1 - x0, y1 - y0) * 6 + 220)))
+
+        def crop_box(current_side: int) -> tuple[int, int, int, int]:
+            left = max(0, min(width - current_side, int(round(center_x - current_side / 2))))
+            top = max(0, min(height - current_side, int(round(center_y - current_side / 2))))
+            right = min(width, left + current_side)
+            bottom = min(height, top + current_side)
+            return left, top, right, bottom
+
+        box = crop_box(min(side, max(width, height)))
+        included: list[dict[str, Any]] = []
+        for _ in range(3):
+            left, top, right, bottom = box
+            included = [
+                group
+                for group in item["groups"]
+                if group["bbox"][0] >= left
+                and group["bbox"][1] >= top
+                and group["bbox"][2] <= right
+                and group["bbox"][3] <= bottom
+            ]
+            if len(included) >= 2 or (right - left == width and bottom - top == height):
+                break
+            side = min(max(width, height), int(side * 1.6))
+            box = crop_box(side)
+        if len(included) < 2:
+            box = (0, 0, width, height)
+            included = item["groups"]
+
+        left, top, right, bottom = box
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        image.crop(box).save(destination, format="PNG", optimize=True)
+
+    adjusted_groups: list[dict[str, Any]] = []
+    for group_index, group in enumerate(included):
+        adjusted_words = []
+        for word in group["words"]:
+            adjusted_words.append(
+                {
+                    "text": word["text"],
+                    "vertices": [[round(x - left, 3), round(y - top, 3)] for x, y in word["vertices"]],
+                }
+            )
+        adjusted_groups.append(
+            {
+                "group_id": f"g{group_index}",
+                "text": group["text"],
+                "words": adjusted_words,
+            }
+        )
+    return adjusted_groups
 
 
 def sample_maptext(source: Path, output: Path) -> Path:
@@ -144,36 +300,59 @@ def sample_maptext(source: Path, output: Path) -> Path:
             continue
     selected = stable_sample(candidates, N_EXAMPLES, SEEDS[leaf], key=lambda x: x["key"])
     task_dir = output / leaf
-    copied: dict[Path, str] = {}
     records: list[dict[str, Any]] = []
     for i, item in enumerate(selected):
-        if item["image"] not in copied:
-            copied[item["image"]] = copy_asset(
-                item["image"], task_dir / "assets", f"map_{len(copied):03d}{item['image'].suffix.lower()}"
-            )
+        crop_path = task_dir / "assets" / f"{i:03d}_map_crop.png"
+        groups = _crop_maptext_example(item, crop_path)
+        flattened_words = [
+            {**word, "group_id": group["group_id"]}
+            for group in groups
+            for word in group["words"]
+        ]
         record = base_record(
             leaf,
             i,
             "Paris and Jerusalem Maps Text Dataset",
             "https://doi.org/10.5281/zenodo.14982663",
             "CC-BY-4.0",
-            item["image_group"],
+            f"{item['image_group']}:{item['anchor_index']}",
         )
         record.update(
             {
                 "input": {
-                    "images": [copied[item["image"]]],
-                    "question": "Transcribe the indicated map label and return its word polygons in reading order.",
+                    "images": [crop_path.relative_to(task_dir).as_posix()],
+                    "question": (
+                        "Detect every visible map-text word in this crop, transcribe it, and assign a group ID. "
+                        "Words that form the same multiword geographic label must share one group ID."
+                    ),
+                    "task_definition": {
+                        "detection": "return one polygon for each word",
+                        "recognition": "transcribe the word inside each polygon",
+                        "grouping": "link words belonging to the same complete map label",
+                    },
                 },
-                "target": {"text": item["text"], "words": item["words"]},
+                "target": {"groups": groups, "words": flattened_words, "group_count": len(groups)},
                 "evaluation": {
-                    "type": "text_spotting",
-                    "metrics": ["normalized_edit_distance", "polygon_iou", "grouping_f1"],
+                    "type": "map_text_spotting_and_grouping",
+                    "metrics": ["word_polygon_iou", "normalized_edit_distance", "grouping_f1"],
                 },
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(output, leaf, records, {"minimum_groups_per_example": 2})
+
+
+OPENEARTHMAP_CLASSES = [
+    {"id": 0, "name": "bareland", "rgb": [128, 0, 0], "hex": "#800000"},
+    {"id": 1, "name": "rangeland", "rgb": [0, 255, 36], "hex": "#00FF24"},
+    {"id": 2, "name": "developed space", "rgb": [148, 148, 148], "hex": "#949494"},
+    {"id": 3, "name": "road", "rgb": [255, 255, 255], "hex": "#FFFFFF"},
+    {"id": 4, "name": "tree", "rgb": [34, 97, 38], "hex": "#226126"},
+    {"id": 5, "name": "water", "rgb": [0, 69, 255], "hex": "#0045FF"},
+    {"id": 6, "name": "agriculture land", "rgb": [75, 181, 73], "hex": "#4BB549"},
+    {"id": 7, "name": "building", "rgb": [222, 31, 7], "hex": "#DE1F07"},
+]
+OPENEARTHMAP_IGNORE_INDEX = 255
 
 
 def _paired_image_labels(source: Path) -> list[tuple[Path, Path, str]]:
@@ -182,7 +361,11 @@ def _paired_image_labels(source: Path) -> list[tuple[Path, Path, str]]:
     for path in _image_files(source):
         parts = [p.lower() for p in path.parts]
         rel = path.relative_to(source)
-        context_parts = [p for p in rel.parts[:-1] if p.lower() not in {"images", "image", "labels", "label", "masks", "mask"}]
+        context_parts = [
+            p
+            for p in rel.parts[:-1]
+            if p.lower() not in {"images", "image", "labels", "label", "masks", "mask"}
+        ]
         key = ("/".join(context_parts), path.stem)
         is_label = any(token in {"labels", "label", "masks", "mask", "annotations"} for token in parts)
         if is_label:
@@ -197,38 +380,116 @@ def _paired_image_labels(source: Path) -> list[tuple[Path, Path, str]]:
     return pairs
 
 
+def _copy_rgb_png(source: Path, destination: Path) -> None:
+    from PIL import Image
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source) as image:
+        image.convert("RGB").save(destination, format="PNG", optimize=True)
+
+
+def _normalize_openearthmap_mask(image_path: Path, label_path: Path, destination: Path) -> dict[int, int]:
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        image_size = image.size
+    with Image.open(label_path) as label:
+        if label.size != image_size:
+            raise ValueError(f"Image/mask size mismatch: {image_path} {image_size} vs {label_path} {label.size}")
+        native = np.asarray(label.convert("RGB")) if label.mode == "P" else np.asarray(label)
+        class_ids = None
+        if native.ndim == 2:
+            unique = set(int(value) for value in np.unique(native))
+            if unique.issubset(set(range(8)) | {OPENEARTHMAP_IGNORE_INDEX}):
+                class_ids = native.astype("uint8")
+            elif unique.issubset(set(range(1, 9)) | {0, OPENEARTHMAP_IGNORE_INDEX}):
+                class_ids = np.full(native.shape, OPENEARTHMAP_IGNORE_INDEX, dtype="uint8")
+                for source_id in range(1, 9):
+                    class_ids[native == source_id] = source_id - 1
+        if class_ids is None:
+            rgb = np.asarray(label.convert("RGB"), dtype="int32")
+            class_ids = np.full(rgb.shape[:2], OPENEARTHMAP_IGNORE_INDEX, dtype="uint8")
+            palette = np.asarray([item["rgb"] for item in OPENEARTHMAP_CLASSES], dtype="int32")
+            distances = ((rgb[:, :, None, :] - palette[None, None, :, :]) ** 2).sum(axis=3)
+            nearest = distances.argmin(axis=2)
+            minimum = distances.min(axis=2)
+            exact_or_near = minimum <= 9
+            class_ids[exact_or_near] = nearest[exact_or_near].astype("uint8")
+            black = np.all(rgb == 0, axis=2)
+            class_ids[black] = OPENEARTHMAP_IGNORE_INDEX
+            unexplained = (~exact_or_near) & (~black)
+            if float(unexplained.mean()) > 0.001:
+                colors = np.unique(rgb[unexplained].reshape(-1, 3), axis=0)[:10]
+                raise ValueError(f"Unexpected OpenEarthMap label colors in {label_path}: {colors.tolist()}")
+
+    valid = set(int(value) for value in np.unique(class_ids))
+    if not valid.issubset(set(range(8)) | {OPENEARTHMAP_IGNORE_INDEX}):
+        raise ValueError(f"Invalid normalized class IDs: {sorted(valid)}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(class_ids, mode="L").save(destination, format="PNG", optimize=True)
+    values, counts = np.unique(class_ids, return_counts=True)
+    return {int(value): int(count) for value, count in zip(values, counts)}
+
+
 def sample_openearthmap(source: Path, output: Path) -> Path:
     leaf = "dense_land_cover_labeling"
     pairs = _paired_image_labels(source)
-    selected = stable_sample(pairs, N_EXAMPLES, SEEDS[leaf], key=lambda x: x[2])
+    by_region: dict[str, list[tuple[Path, Path, str]]] = defaultdict(list)
+    for pair in pairs:
+        region = pair[2].split("/")[0] or "unknown_region"
+        by_region[region].append(pair)
+    selected = balanced_sample(by_region, N_EXAMPLES, SEEDS[leaf], key=lambda x: x[2])
     task_dir = output / leaf
+    ontology = {str(item["id"]): {"name": item["name"], "rgb": item["rgb"], "hex": item["hex"]} for item in OPENEARTHMAP_CLASSES}
+    legend = "; ".join(f"{item['id']}={item['name']}" for item in OPENEARTHMAP_CLASSES)
     records: list[dict[str, Any]] = []
-    classes = ["bareland", "rangeland", "developed_space", "road", "tree", "water", "agriculture", "building"]
-    for i, (image, label, group_id) in enumerate(selected):
+    for i, (_, (image, label, group_id)) in enumerate(selected):
+        image_destination = task_dir / "assets" / f"{i:03d}_image.png"
+        mask_destination = task_dir / "assets" / f"{i:03d}_mask.png"
+        _copy_rgb_png(image, image_destination)
+        pixel_counts = _normalize_openearthmap_mask(image, label, mask_destination)
         record = base_record(
             leaf,
             i,
             "OpenEarthMap",
             "https://doi.org/10.5281/zenodo.7223446",
-            "Source-dependent; commonly CC-BY-NC-SA-4.0 (verify per region)",
+            "Source-dependent; label license follows the source image license",
             group_id.split("/")[0],
         )
         record.update(
             {
                 "input": {
-                    "images": [copy_asset(image, task_dir / "assets", f"{i:03d}_image{image.suffix.lower()}")],
-                    "question": "Assign one land-cover class to every pixel.",
-                    "classes": classes,
+                    "images": [image_destination.relative_to(task_dir).as_posix()],
+                    "question": (
+                        "Produce a single-channel per-pixel semantic land-cover mask using this exact class-index "
+                        f"ontology: {legend}. Use 255 only for ignored or unlabeled pixels."
+                    ),
+                    "classes": [item["name"] for item in OPENEARTHMAP_CLASSES],
+                    "class_ontology": ontology,
+                    "mask_encoding": "8-bit class-index PNG",
                 },
                 "target": {
-                    "mask": copy_asset(label, task_dir / "assets", f"{i:03d}_mask{label.suffix.lower()}"),
-                    "classes": classes,
+                    "mask": mask_destination.relative_to(task_dir).as_posix(),
+                    "classes": [item["name"] for item in OPENEARTHMAP_CLASSES],
+                    "class_ontology": ontology,
+                    "ignore_index": OPENEARTHMAP_IGNORE_INDEX,
+                    "pixel_counts": {str(key): value for key, value in pixel_counts.items()},
                 },
-                "evaluation": {"type": "semantic_segmentation", "metrics": ["mean_iou", "macro_f1"]},
+                "evaluation": {
+                    "type": "semantic_segmentation",
+                    "metrics": ["mean_iou", "macro_f1"],
+                    "ignore_index": OPENEARTHMAP_IGNORE_INDEX,
+                },
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"mask_encoding": "uint8_class_index", "ignore_index": OPENEARTHMAP_IGNORE_INDEX, "ontology": ontology},
+    )
 
 
 def sample_eurosat(source: Path, output: Path) -> Path:

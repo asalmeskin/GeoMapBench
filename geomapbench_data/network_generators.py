@@ -14,14 +14,39 @@ from .common import N_EXAMPLES, SEEDS, base_record, copy_asset, finalize_task, s
 
 OSM_LICENSE = "ODbL-1.0; maps must attribute © OpenStreetMap contributors"
 
+GLOBAL_OSM_CITIES = [
+    ("Zurich", "Switzerland", 47.3769, 8.5417),
+    ("Lisbon", "Portugal", 38.7223, -9.1393),
+    ("Warsaw", "Poland", 52.2297, 21.0122),
+    ("Cairo", "Egypt", 30.0444, 31.2357),
+    ("Nairobi", "Kenya", -1.2864, 36.8172),
+    ("Cape Town", "South Africa", -33.9249, 18.4241),
+    ("Istanbul", "Türkiye", 41.0082, 28.9784),
+    ("Dubai", "United Arab Emirates", 25.2048, 55.2708),
+    ("Amman", "Jordan", 31.9539, 35.9106),
+    ("Tokyo", "Japan", 35.6762, 139.6503),
+    ("Seoul", "South Korea", 37.5665, 126.9780),
+    ("Mumbai", "India", 19.0760, 72.8777),
+    ("Singapore", "Singapore", 1.3521, 103.8198),
+    ("New York City", "United States", 40.7128, -74.0060),
+    ("Mexico City", "Mexico", 19.4326, -99.1332),
+    ("Toronto", "Canada", 43.6532, -79.3832),
+    ("São Paulo", "Brazil", -23.5505, -46.6333),
+    ("Bogotá", "Colombia", 4.7110, -74.0721),
+    ("Sydney", "Australia", -33.8688, 151.2093),
+    ("Auckland", "New Zealand", -36.8509, 174.7645),
+]
+
 
 def _configure_osmnx(cache: Path):
     import osmnx as ox
 
     ox.settings.use_cache = True
     ox.settings.cache_folder = cache / "osmnx_http"
-    ox.settings.requests_timeout = 180
+    ox.settings.requests_timeout = 300
     ox.settings.log_console = False
+    if hasattr(ox.settings, "overpass_rate_limit"):
+        ox.settings.overpass_rate_limit = True
     return ox
 
 
@@ -31,7 +56,28 @@ def _feature_id(index: Any) -> str:
     return str(index)
 
 
-def _plot_anchor_candidates(gdf, target_name: str, destination: Path) -> str:
+def _geometry_family(geometry) -> str:
+    kind = geometry.geom_type.lower()
+    if "point" in kind:
+        return "point"
+    if "line" in kind:
+        return "line"
+    return "polygon"
+
+
+def _iter_polygon_parts(geometry):
+    if geometry is None or geometry.is_empty:
+        return
+    if geometry.geom_type == "Polygon":
+        yield geometry
+    elif geometry.geom_type == "MultiPolygon":
+        yield from geometry.geoms
+    elif geometry.geom_type == "GeometryCollection":
+        for part in geometry.geoms:
+            yield from _iter_polygon_parts(part)
+
+
+def _plot_anchor_candidates(gdf, target_position: int, target_name: str, destination: Path) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -41,60 +87,120 @@ def _plot_anchor_candidates(gdf, target_name: str, destination: Path) -> str:
     fig, ax = plt.subplots(figsize=(6, 6), dpi=140)
     colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3"]
     letters = ["A", "B", "C", "D"]
-    for (_, row), color, letter in zip(gdf.iterrows(), colors, letters):
+    for position, ((_, row), color, letter) in enumerate(zip(gdf.iterrows(), colors, letters)):
         geometry = row.geometry
-        try:
-            import geopandas as gpd
+        if geometry.geom_type in {"Point", "MultiPoint"}:
+            point = geometry.representative_point()
+            ax.scatter([point.x], [point.y], s=95, facecolors="none", edgecolors=color, linewidths=2.2)
+        else:
+            try:
+                import geopandas as gpd
 
-            gpd.GeoSeries([geometry], crs=gdf.crs).plot(ax=ax, facecolor="none", edgecolor=color, linewidth=2)
-        except Exception:
-            continue
-        point = geometry.representative_point()
-        ax.annotate(letter, (point.x, point.y), color=color, fontsize=12, weight="bold",
-                    bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": color, "pad": 1.5})
-        ax.annotate(str(row["name"]), (point.x, point.y), xytext=(9, 0), textcoords="offset points", fontsize=7,
-                    bbox={"facecolor": "white", "alpha": 0.65, "edgecolor": "none", "pad": 1})
-    ax.set_title(f"Anchor the label: {target_name}", fontsize=10)
+                gpd.GeoSeries([geometry], crs=gdf.crs).plot(
+                    ax=ax,
+                    facecolor="none",
+                    edgecolor=color,
+                    linewidth=2.2,
+                )
+            except Exception:
+                continue
+            point = geometry.representative_point()
+        ax.annotate(
+            letter,
+            (point.x, point.y),
+            xytext=(5, 5),
+            textcoords="offset points",
+            color=color,
+            fontsize=12,
+            weight="bold",
+            bbox={"facecolor": "white", "alpha": 0.8, "edgecolor": color, "pad": 1.5},
+        )
+        if position == target_position:
+            ax.annotate(
+                target_name,
+                (point.x, point.y),
+                xytext=(14, -16),
+                textcoords="offset points",
+                fontsize=9,
+                weight="bold",
+                arrowprops={"arrowstyle": "->", "color": "black", "linewidth": 1.2},
+                bbox={"facecolor": "#fff7bc", "alpha": 0.9, "edgecolor": "#666", "pad": 2},
+            )
+    ax.set_title("Match the displayed map label to its geographic feature", fontsize=10)
+    ax.set_aspect("equal", adjustable="datalim")
     ax.set_axis_off()
     ax.text(0.01, 0.01, "© OpenStreetMap contributors", transform=ax.transAxes, fontsize=6, color="#555")
     fig.tight_layout(pad=0.3)
     fig.savefig(destination, bbox_inches="tight")
     plt.close(fig)
-    return destination.as_posix()
+
+
+def _features_from_point_with_retry(ox, point, tags, distance: int, city: str):
+    import time
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            return ox.features_from_point(point, tags=tags, dist=distance)
+        except Exception as error:
+            last_error = error
+            if attempt < 4:
+                time.sleep(20 * (attempt + 1))
+    raise RuntimeError(f"Could not download named features for {city}: {last_error}")
 
 
 def generate_osm_label_anchoring(cache: Path, output: Path) -> Path:
     import geopandas as gpd
-    import pandas as pd
 
     leaf = "map_label_feature_anchoring"
     ox = _configure_osmnx(cache)
-    rng = random.Random(SEEDS[leaf])
     task_dir = output / leaf
     records: list[dict[str, Any]] = []
-    cities = WIKIMEDIA_CITIES[:10]
-    tags = {"amenity": True, "tourism": True, "leisure": True, "natural": True, "place": True}
-    for city_index, (city, country, lat, lon) in enumerate(cities):
-        gdf = ox.features_from_point((lat, lon), tags=tags, dist=5000)
+    tags = {
+        "amenity": [
+            "restaurant", "cafe", "school", "university", "hospital", "clinic",
+            "library", "theatre", "cinema", "marketplace", "place_of_worship",
+        ],
+        "tourism": ["attraction", "museum", "gallery", "hotel", "viewpoint"],
+        "leisure": ["park", "garden", "stadium", "sports_centre", "playground"],
+        "historic": True,
+    }
+    choices = ["A", "B", "C", "D"]
+    for city_index, (city, country, lat, lon) in enumerate(GLOBAL_OSM_CITIES):
+        gdf = _features_from_point_with_retry(ox, (lat, lon), tags, 4000, city)
         if gdf.empty or "name" not in gdf:
             raise ValueError(f"No named OSM features found for {city}")
         gdf = gdf[gdf["name"].notna() & gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
-        gdf["_fid"] = [_feature_id(idx) for idx in gdf.index]
-        # One feature per OSM identity; deterministic order before city-specific shuffle.
+        gdf["name"] = gdf["name"].astype(str)
+        gdf["_fid"] = [_feature_id(index) for index in gdf.index]
+        gdf["_family"] = [_geometry_family(geometry) for geometry in gdf.geometry]
         gdf = gdf.sort_values("_fid").drop_duplicates("_fid")
-        indices = list(gdf.index)
-        random.Random(SEEDS[leaf] + city_index).shuffle(indices)
-        if len(indices) < 40:
-            raise ValueError(f"Need 40 named OSM features for {city}, found {len(indices)}")
-        for local_index in range(10):
-            subset_indices = indices[local_index * 4 : local_index * 4 + 4]
-            subset = gdf.loc[subset_indices].copy()
-            target_position = rng.randrange(4)
-            target = subset.iloc[target_position]
+        if len(gdf) < 12:
+            raise ValueError(f"Need at least 12 named OSM features for {city}, found {len(gdf)}")
+        projected = gdf.to_crs(gdf.estimate_utm_crs())
+        projected["_anchor"] = projected.geometry.representative_point()
+        targets = stable_sample(list(gdf.index), 5, SEEDS[leaf] + city_index, key=_feature_id)
+        for local_index, target_index in enumerate(targets):
+            target_projected = projected.loc[[target_index]].iloc[0]
+            family = target_projected["_family"]
+            target_point = target_projected["_anchor"]
+            candidate_pool = projected[projected["_family"] == family].copy()
+            if len(candidate_pool) < 4:
+                candidate_pool = projected.copy()
+            candidate_pool["_distance"] = candidate_pool["_anchor"].distance(target_point)
+            negative_indices = [index for index in candidate_pool.sort_values(["_distance", "_fid"]).index if index != target_index][:3]
+            if len(negative_indices) < 3:
+                raise ValueError(f"Could not construct four candidates for {city} target {target_index}")
+            subset_indices = [target_index, *negative_indices]
+            rng = random.Random(SEEDS[leaf] + city_index * 100 + local_index)
+            rng.shuffle(subset_indices)
+            target_position = subset_indices.index(target_index)
+            subset = projected.reindex(subset_indices).copy()
+            target = gdf.loc[[target_index]].iloc[0]
             global_index = len(records)
             image_path = task_dir / "assets" / f"{global_index:03d}.png"
-            _plot_anchor_candidates(subset, str(target["name"]), image_path)
-            choices = ["A", "B", "C", "D"]
+            _plot_anchor_candidates(subset, target_position, str(target["name"]), image_path)
+            anchor_wgs84 = gpd.GeoSeries([target.geometry.representative_point()], crs=gdf.crs).to_crs(4326).iloc[0]
             record = base_record(
                 leaf,
                 global_index,
@@ -107,24 +213,34 @@ def generate_osm_label_anchoring(cache: Path, output: Path) -> Path:
                 {
                     "input": {
                         "images": [image_path.relative_to(task_dir).as_posix()],
-                        "question": f"Which candidate geometry is anchored to the label “{target['name']}”?",
+                        "question": (
+                            f"The displayed map label “{target['name']}” is anchored at its real map position. "
+                            "Which candidate geometry (A, B, C, or D) is the geographic feature named by that label?"
+                        ),
                         "choices": choices,
+                        "city": city,
+                        "country": country,
+                        "task_definition": "text-to-geographic-feature grounding",
                     },
                     "target": {
                         "answer": choices[target_position],
                         "choice_index": target_position,
                         "feature_id": target["_fid"],
+                        "feature_name": str(target["name"]),
+                        "geometry_family": target["_family"],
+                        "label_anchor": {"longitude": anchor_wgs84.x, "latitude": anchor_wgs84.y},
                         "geometry": target.geometry.__geo_interface__,
                     },
                     "evaluation": {"type": "multimodal_grounding", "metrics": ["choice_accuracy", "geometry_iou"]},
                 }
             )
             records.append(record)
-    rng.shuffle(records)
-    # Re-assign public IDs after shuffling without changing group/provenance.
-    for index, record in enumerate(records):
-        record["id"] = f"{leaf}-{index:03d}"
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"cities": [city for city, _, _, _ in GLOBAL_OSM_CITIES], "examples_per_city": 5},
+    )
 
 
 TILE_RE = re.compile(r"(AOI_\d+_[A-Za-z]+_img\d+|img\d+)", re.IGNORECASE)
@@ -320,16 +436,34 @@ def _plot_osm_isochrone(graph, center, polygon, destination: Path, show_polygon:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(5, 5), dpi=130)
-    for u, v in graph.edges:
-        ax.plot([graph.nodes[u]["x"], graph.nodes[v]["x"]], [graph.nodes[u]["y"], graph.nodes[v]["y"]], color="#c9c9c9", linewidth=0.35)
-    if show_polygon and not polygon.is_empty:
-        x, y = polygon.exterior.xy
-        ax.fill(x, y, color="#6a3d9a", alpha=0.35)
-        ax.plot(x, y, color="#6a3d9a", linewidth=1.2)
+    segments = []
+    for u, v in graph.edges():
+        try:
+            segments.append(
+                [
+                    (float(graph.nodes[u]["x"]), float(graph.nodes[u]["y"])),
+                    (float(graph.nodes[v]["x"]), float(graph.nodes[v]["y"])),
+                ]
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    if segments:
+        ax.add_collection(LineCollection(segments, colors="#c9c9c9", linewidths=0.35))
+    if show_polygon and polygon is not None and not polygon.is_empty:
+        for part in _iter_polygon_parts(polygon):
+            x, y = part.exterior.xy
+            ax.fill(x, y, color="#6a3d9a", alpha=0.35)
+            ax.plot(x, y, color="#6a3d9a", linewidth=1.2)
     ax.scatter([graph.nodes[center]["x"]], [graph.nodes[center]["y"]], c="#e31a1c", s=25, zorder=4)
+    xs = [float(data["x"]) for _, data in graph.nodes(data=True)]
+    ys = [float(data["y"]) for _, data in graph.nodes(data=True)]
+    if xs and ys:
+        ax.set_xlim(min(xs), max(xs))
+        ax.set_ylim(min(ys), max(ys))
     ax.set_axis_off()
     ax.text(0.01, 0.01, "© OpenStreetMap contributors", transform=ax.transAxes, fontsize=6, color="#555")
     fig.tight_layout(pad=0.1)
@@ -337,29 +471,108 @@ def _plot_osm_isochrone(graph, center, polygon, destination: Path, show_polygon:
     plt.close(fig)
 
 
+def _service_area_polygon(graph, reachable_nodes, ox, buffer_metres: float = 35.0):
+    import geopandas as gpd
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+
+    projected = ox.project_graph(graph)
+    reachable = set(reachable_nodes)
+    lines = []
+    for u, v, data in projected.edges(data=True):
+        if u not in reachable or v not in reachable:
+            continue
+        geometry = data.get("geometry")
+        if geometry is None:
+            geometry = LineString(
+                [
+                    (float(projected.nodes[u]["x"]), float(projected.nodes[u]["y"])),
+                    (float(projected.nodes[v]["x"]), float(projected.nodes[v]["y"])),
+                ]
+            )
+        if geometry is not None and not geometry.is_empty:
+            lines.append(geometry)
+    if not lines:
+        center = next(iter(reachable))
+        geometry = gpd.GeoSeries.from_xy(
+            [projected.nodes[center]["x"]],
+            [projected.nodes[center]["y"]],
+            crs=projected.graph["crs"],
+        ).iloc[0].buffer(buffer_metres)
+    else:
+        geometry = unary_union(lines).buffer(buffer_metres, cap_style=1, join_style=1).buffer(0)
+    if geometry.is_empty:
+        raise ValueError("Empty buffered service-area geometry")
+    area_m2 = float(geometry.area)
+    geometry_wgs84 = gpd.GeoSeries([geometry], crs=projected.graph["crs"]).to_crs(4326).iloc[0]
+    return geometry_wgs84, area_m2
+
+
+def _graph_from_point_with_retry(ox, point, distance: int, city: str):
+    import time
+
+    last_error = None
+    for attempt in range(5):
+        try:
+            return ox.graph_from_point(
+                point,
+                dist=distance,
+                network_type="walk",
+                simplify=True,
+                retain_all=False,
+            )
+        except Exception as error:
+            last_error = error
+            if attempt < 4:
+                time.sleep(20 * (attempt + 1))
+    raise RuntimeError(f"Could not download walking network for {city}: {last_error}")
+
+
 def generate_osm_isochrones(cache: Path, output: Path) -> Path:
+    import gc
     import networkx as nx
-    from shapely.geometry import MultiPoint, mapping
+    from shapely.geometry import mapping
 
     leaf = "isochrone_service_area"
     ox = _configure_osmnx(cache)
     task_dir = output / leaf
     records: list[dict[str, Any]] = []
-    for city_index, (city, country, lat, lon) in enumerate(WIKIMEDIA_CITIES[:10]):
-        graph = ox.graph_from_point((lat, lon), dist=3000, network_type="walk", simplify=True)
-        # 1.4 m/s is a declared benchmark assumption, not an OSM attribute.
-        for _, _, _, data in graph.edges(keys=True, data=True):
-            data["travel_time"] = float(data.get("length", 0.0)) / 1.4
-        nodes = sorted(graph.nodes)
-        chosen = stable_sample(nodes, 10, SEEDS[leaf] + city_index, key=str)
+    walking_speeds_mps = (0.9, 1.1, 1.3, 1.5, 1.7)
+    budgets_min = (5, 10, 15, 20)
+    query_distance = 3200
+
+    for city_index, (city, country, lat, lon) in enumerate(GLOBAL_OSM_CITIES):
+        graph = _graph_from_point_with_retry(ox, (lat, lon), query_distance, city)
+        if graph.number_of_nodes() < 10 or graph.number_of_edges() == 0:
+            raise ValueError(f"Walking graph for {city} is too small")
+        if graph.is_directed():
+            largest_component = max(nx.weakly_connected_components(graph), key=len)
+        else:
+            largest_component = max(nx.connected_components(graph), key=len)
+        ranked_nodes = sorted(
+            largest_component,
+            key=lambda node: (
+                (float(graph.nodes[node]["x"]) - lon) ** 2 + (float(graph.nodes[node]["y"]) - lat) ** 2,
+                str(node),
+            ),
+        )
+        candidate_nodes = ranked_nodes[: min(300, len(ranked_nodes))]
+        chosen = stable_sample(candidate_nodes, 5, SEEDS[leaf] + city_index, key=str)
         for local_index, center in enumerate(chosen):
             global_index = len(records)
-            budget_min = 5 + (local_index % 3) * 5
-            subgraph = nx.ego_graph(graph, center, radius=budget_min * 60, distance="travel_time")
-            points = MultiPoint([(graph.nodes[n]["x"], graph.nodes[n]["y"]) for n in subgraph.nodes])
-            polygon = points.convex_hull
-            if polygon.geom_type != "Polygon":
-                polygon = points.buffer(0.0001).convex_hull
+            budget_min = budgets_min[global_index % len(budgets_min)]
+            speed_mps = walking_speeds_mps[(global_index * 3) % len(walking_speeds_mps)]
+            distance_budget_m = budget_min * 60.0 * speed_mps
+            reachable_lengths = nx.single_source_dijkstra_path_length(
+                graph,
+                center,
+                cutoff=distance_budget_m,
+                weight="length",
+            )
+            reachable_nodes = sorted(reachable_lengths, key=str)
+            if not reachable_nodes:
+                reachable_nodes = [center]
+            polygon, area_m2 = _service_area_polygon(graph, reachable_nodes, ox)
             input_path = task_dir / "assets" / f"{global_index:03d}_input.png"
             target_path = task_dir / "assets" / f"{global_index:03d}_isochrone.png"
             _plot_osm_isochrone(graph, center, polygon, input_path, False)
@@ -370,24 +583,56 @@ def generate_osm_isochrones(cache: Path, output: Path) -> Path:
                 "OpenStreetMap pedestrian network via Overpass",
                 "https://wiki.openstreetmap.org/wiki/Overpass_API",
                 OSM_LICENSE,
-                f"{city}:{center}:{budget_min}",
+                f"{city}:{center}:{budget_min}:{speed_mps:.1f}",
             )
             record.update(
                 {
                     "input": {
                         "images": [input_path.relative_to(task_dir).as_posix()],
-                        "question": f"Compute the area reachable within {budget_min} minutes on foot from the red point, assuming 1.4 m/s.",
+                        "question": (
+                            f"Compute the pedestrian service area reachable within {budget_min} minutes from the red "
+                            f"point at a constant walking speed of {speed_mps:.1f} m/s. Respect the street network; "
+                            "do not fill disconnected barriers or gaps."
+                        ),
                         "budget_minutes": budget_min,
-                        "origin": {"longitude": graph.nodes[center]["x"], "latitude": graph.nodes[center]["y"]},
+                        "speed_mps": speed_mps,
+                        "network_distance_budget_m": distance_budget_m,
+                        "city": city,
+                        "country": country,
+                        "origin": {
+                            "longitude": float(graph.nodes[center]["x"]),
+                            "latitude": float(graph.nodes[center]["y"]),
+                        },
                     },
                     "target": {
                         "isochrone_image": target_path.relative_to(task_dir).as_posix(),
                         "isochrone_geojson": mapping(polygon),
-                        "reachable_node_count": subgraph.number_of_nodes(),
+                        "reachable_node_count": len(reachable_nodes),
+                        "reachable_node_ids": [str(node) for node in reachable_nodes],
+                        "service_area_m2": round(area_m2, 3),
+                        "construction_method": "buffered reachable street edges in a local projected CRS",
                     },
-                    "evaluation": {"type": "service_area", "metrics": ["polygon_iou", "reachable_node_f1"]},
+                    "evaluation": {
+                        "type": "service_area",
+                        "metrics": ["polygon_iou", "reachable_node_f1", "relative_area_error"],
+                    },
                 }
             )
             records.append(record)
-    return finalize_task(output, leaf, records)
+            del reachable_lengths, reachable_nodes, polygon
+            gc.collect()
+        del graph
+        gc.collect()
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {
+            "cities": [city for city, _, _, _ in GLOBAL_OSM_CITIES],
+            "examples_per_city": 5,
+            "walking_speeds_mps": list(walking_speeds_mps),
+            "budgets_minutes": list(budgets_min),
+            "polygon_method": "buffered_reachable_edges",
+        },
+    )
 

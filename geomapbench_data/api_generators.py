@@ -86,52 +86,108 @@ COMPARISON_INDICATORS = {
     "NY.GDP.PCAP.CD": ("GDP per capita", "current US dollars"),
     "AG.LND.FRST.ZS": ("forest area share", "percent of land area"),
 }
+COMPARISON_YEARS = (2000, 2005, 2010, 2015, 2018, 2020, 2021, 2022, 2023)
 
 
 def generate_cross_entity_comparison(cache: Path, output: Path) -> Path:
     leaf = "cross_entity_comparison"
     countries = _world_bank_countries(cache)
-    values = {indicator: _world_bank_indicator(cache, indicator) for indicator in COMPARISON_INDICATORS}
-    candidates: list[tuple[str, str, str]] = []
-    for indicator, table in values.items():
+    tables = {
+        (indicator, year): _world_bank_indicator(cache, indicator, year)
+        for indicator in COMPARISON_INDICATORS
+        for year in COMPARISON_YEARS
+    }
+    grouped_candidates: dict[str, list[tuple[str, int, str, str]]] = {}
+    for (indicator, year), table in tables.items():
         codes = sorted(set(countries) & set(table))
+        pairs: list[tuple[str, int, str, str]] = []
+        seen: set[tuple[str, str]] = set()
         for offset, code in enumerate(codes):
-            other = codes[(offset * 37 + 17) % len(codes)]
-            if code != other and float(table[code]["value"]) != float(table[other]["value"]):
-                pair = tuple(sorted((code, other)))
-                candidates.append((indicator, pair[0], pair[1]))
-    selected = stable_sample(set(candidates), N_EXAMPLES, SEEDS[leaf], key=lambda x: ":".join(x))
+            if len(codes) < 2:
+                continue
+            other = codes[(offset * 37 + year + 17) % len(codes)]
+            if code == other:
+                other = codes[(codes.index(code) + 1) % len(codes)]
+            pair = tuple(sorted((code, other)))
+            if pair in seen:
+                continue
+            value_a = float(table[pair[0]]["value"])
+            value_b = float(table[pair[1]]["value"])
+            if value_a == value_b:
+                continue
+            seen.add(pair)
+            pairs.append((indicator, year, pair[0], pair[1]))
+        grouped_candidates[f"{indicator}:{year}"] = pairs
+
+    from .common import balanced_sample
+
+    selected = balanced_sample(
+        grouped_candidates,
+        N_EXAMPLES,
+        SEEDS[leaf],
+        key=lambda x: f"{x[0]}:{x[1]}:{x[2]}:{x[3]}",
+    )
+    templates = (
+        ("higher", lambda metric, year, a, b: f"Which had the higher {metric} in {year}: {a} or {b}?"),
+        ("lower", lambda metric, year, a, b: f"Which had the lower {metric} in {year}: {a} or {b}?"),
+        ("higher", lambda metric, year, a, b: f"Compare {a} and {b}. Which country recorded a larger {metric} value in {year}?"),
+        ("lower", lambda metric, year, a, b: f"For {year}, which country had the smaller {metric}: {a} or {b}?"),
+    )
     records: list[dict[str, Any]] = []
-    for i, (indicator, code_a, code_b) in enumerate(selected):
+    for i, (_, (indicator, year, code_a, code_b)) in enumerate(selected):
+        table = tables[(indicator, year)]
         name_a, name_b = countries[code_a]["name"], countries[code_b]["name"]
-        value_a = float(values[indicator][code_a]["value"])
-        value_b = float(values[indicator][code_b]["value"])
+        value_a = float(table[code_a]["value"])
+        value_b = float(table[code_b]["value"])
         metric_name, unit = COMPARISON_INDICATORS[indicator]
-        answer = name_a if value_a > value_b else name_b
-        relation = "greater"
+        relation, template = templates[i % len(templates)]
+        if relation == "higher":
+            answer = name_a if value_a > value_b else name_b
+        else:
+            answer = name_a if value_a < value_b else name_b
+        difference = abs(value_a - value_b)
+        ratio = max(abs(value_a), abs(value_b)) / max(min(abs(value_a), abs(value_b)), 1e-12)
         record = base_record(
             leaf,
             i,
             f"World Development Indicators: {indicator}",
             f"https://api.worldbank.org/v2/indicator/{indicator}",
             "CC-BY-4.0",
-            f"{indicator}:{code_a}:{code_b}",
+            f"{indicator}:{year}:{code_a}:{code_b}",
         )
         record.update(
             {
-                "input": {"question": f"Which had the higher {metric_name} in {WORLD_BANK_YEAR}: {name_a} or {name_b}?"},
+                "input": {
+                    "question": template(metric_name, year, name_a, name_b),
+                    "indicator": indicator,
+                    "indicator_name": metric_name,
+                    "year": year,
+                    "entities": [name_a, name_b],
+                    "comparison_direction": relation,
+                },
                 "target": {
                     "answer": answer,
                     "relation": relation,
                     "values": {name_a: value_a, name_b: value_b},
+                    "absolute_difference": difference,
+                    "larger_to_smaller_ratio": ratio,
                     "unit": unit,
-                    "year": WORLD_BANK_YEAR,
+                    "year": year,
+                    "indicator": indicator,
                 },
-                "evaluation": {"type": "comparison", "metric": "accuracy"},
+                "evaluation": {"type": "comparison", "metrics": ["accuracy", "value_consistency"]},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {
+            "years": sorted({r["target"]["year"] for r in records}),
+            "indicators": sorted({r["target"]["indicator"] for r in records}),
+        },
+    )
 
 
 def _macrostrat_data(payload: Any) -> list[dict[str, Any]]:

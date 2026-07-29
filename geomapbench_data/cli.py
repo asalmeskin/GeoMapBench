@@ -84,7 +84,12 @@ def make_parser() -> argparse.ArgumentParser:
 
     env = sub.add_parser("environmental-layer")
     env.add_argument("--cache", type=_path, required=True)
-    env.add_argument("--koppen-raster", type=_path, required=True)
+    env.add_argument(
+        "--koppen-raster",
+        type=_path,
+        required=False,
+        help="Deprecated compatibility argument; the revised task uses balanced WorldClim layers.",
+    )
     env.add_argument("--output", type=_path, required=True)
 
     val = sub.add_parser("validate")

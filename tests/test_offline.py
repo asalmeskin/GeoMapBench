@@ -34,14 +34,22 @@ def test_offline_samplers_are_exact_and_valid(tmp_path: Path) -> None:
 
     maptext = raw / "maptext"
     _image(maptext / "images" / "map.jpg")
+    # The official format may repeat an image once per text sequence. Each
+    # record below is one sequence; the sampler aggregates them by image before
+    # creating crop-level detection/recognition/grouping examples.
     annotation = [
         {
             "image": "map.jpg",
             "groups": [
-                {"text": f"Place {i}", "vertices": [[0, 0], [10, 0], [10, 5], [0, 5]], "illegible": False, "truncated": False}
-                for i in range(120)
+                {
+                    "text": f"Place {i}",
+                    "vertices": [[0, 0], [10, 0], [10, 5], [0, 5]],
+                    "illegible": False,
+                    "truncated": False,
+                }
             ],
         }
+        for i in range(120)
     ]
     (maptext / "maptext_format.json").write_text(json.dumps(annotation), encoding="utf-8")
     sample_maptext(maptext, out)
