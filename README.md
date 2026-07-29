@@ -2,23 +2,6 @@
 
 This package builds **exactly 100 deterministic examples for each of 23 leaves** in the revised GeoMapBench taxonomy. It does not bundle multi-gigabyte upstream imagery or silently relicense it. Instead, it supplies official source links, download helpers, fixed per-leaf seeds, source-specific samplers, public-API generators, cached raw responses, provenance, and validation.
 
-## July 2026 quality revision
-
-Release `1.1.0` directly corrects eight benchmark-design problems:
-
-- Coordinate transformation now balances six reversible transformation modes instead of always starting in WGS 84 and ending in local UTM.
-- Cross-entity comparison spans nine years, four World Bank indicators, and both higher/lower comparisons.
-- OpenEarthMap RGB annotations are decoded into validated single-channel class-index masks with an explicit eight-class ontology.
-- Environmental layer identification is a balanced six-way WorldClim raster-identification task rather than a one-layer Köppen-only task.
-- GeoNames feature-class codes and definitions are included in every geo-entity-typing prompt.
-- OSM isochrones cover 20 globally distributed cities, multiple time budgets and walking speeds, and use buffered reachable street edges instead of a convex hull.
-- Map-label anchoring hides candidate names and displays the target label at its actual anchor position over four nearby candidate geometries.
-- Map-text examples require detection, transcription, and grouping of every visible word in a crop, with at least two label groups per example.
-
-The validator enforces these properties for the eight revised leaves. Their manifests contain `data_revision = "2026-07-comments-v2"`.
-
-A minimal Colab that rebuilds **only these eight leaves** is included at [`notebooks/GeoMapBench_fixed_tasks_colab.ipynb`](notebooks/GeoMapBench_fixed_tasks_colab.ipynb). The other 15 task generators are intentionally not called.
-
 ## Taxonomy decisions
 
 No original capability was removed. One over-broad leaf was corrected:
