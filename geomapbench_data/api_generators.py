@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image
 
-from .common import N_EXAMPLES, SEEDS, base_record, finalize_task, stable_sample
+from .common import N_EXAMPLES, SEEDS, balanced_sample, base_record, finalize_task, stable_sample
 from .download import USER_AGENT, download
 from .static_generators import _place_name, natural_earth
 
@@ -28,6 +28,7 @@ def _cached_json(url: str, path: Path, refresh: bool = False) -> Any:
 
 WORLD_BANK_BASE = "https://api.worldbank.org/v2"
 WORLD_BANK_YEAR = 2023
+POPULATION_DENSITY_YEARS = (2000, 2005, 2010, 2015, 2018, 2020, 2021, 2022, 2023)
 
 
 def _world_bank_countries(cache: Path) -> dict[str, dict[str, Any]]:
@@ -51,33 +52,72 @@ def _world_bank_indicator(cache: Path, indicator: str, year: int = WORLD_BANK_YE
 def generate_population_density(cache: Path, output: Path) -> Path:
     leaf = "population_density_estimation"
     countries = _world_bank_countries(cache)
-    density = _world_bank_indicator(cache, "EN.POP.DNST")
-    candidates = [
-        (code, countries[code], density[code])
-        for code in sorted(set(countries) & set(density))
-    ]
-    selected = stable_sample(candidates, N_EXAMPLES, SEEDS[leaf], key=lambda x: x[0])
+    groups: dict[str, list[tuple[str, dict[str, Any], dict[str, Any]]]] = {}
+    for year in POPULATION_DENSITY_YEARS:
+        table = _world_bank_indicator(cache, "EN.POP.DNST", year)
+        groups[str(year)] = [
+            (code, countries[code], table[code])
+            for code in sorted(set(countries) & set(table))
+        ]
+
+    selected = balanced_sample(
+        groups,
+        N_EXAMPLES,
+        SEEDS[leaf],
+        key=lambda item: item[0],
+    )
     records: list[dict[str, Any]] = []
-    for i, (code, country, row) in enumerate(selected):
+    year_counts: dict[int, int] = {year: 0 for year in POPULATION_DENSITY_YEARS}
+    for i, (year_text, item) in enumerate(selected):
+        code, country, row = item
+        year = int(year_text)
         name = country["name"]
         value = float(row["value"])
+        year_counts[year] += 1
         record = base_record(
             leaf,
             i,
             "World Development Indicators: EN.POP.DNST",
             "https://data.worldbank.org/indicator/EN.POP.DNST",
             "CC-BY-4.0",
-            code,
+            f"{code}:{year}",
         )
         record.update(
             {
-                "input": {"question": f"What was the population density of {name} in {WORLD_BANK_YEAR}, in people per square kilometre of land area?"},
-                "target": {"value": round(value, 6), "unit": "people per sq. km of land area", "year": WORLD_BANK_YEAR},
-                "evaluation": {"type": "numeric", "relative_tolerance": 0.005},
+                "input": {
+                    "question": (
+                        f"What was the population density of {name} in {year}, "
+                        "in people per square kilometre of land area?"
+                    ),
+                    "country": name,
+                    "country_code": code,
+                    "year": year,
+                    "indicator": "EN.POP.DNST",
+                },
+                "target": {
+                    "value": round(value, 6),
+                    "unit": "people per sq. km of land area",
+                    "year": year,
+                    "indicator": "EN.POP.DNST",
+                },
+                "evaluation": {
+                    "type": "numeric",
+                    "relative_tolerance": 0.005,
+                    "unit": "people per sq. km of land area",
+                },
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {
+            "years": list(POPULATION_DENSITY_YEARS),
+            "year_distribution": {str(year): year_counts[year] for year in POPULATION_DENSITY_YEARS},
+            "indicator": "EN.POP.DNST",
+        },
+    )
 
 
 COMPARISON_INDICATORS = {

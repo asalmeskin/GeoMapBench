@@ -16,6 +16,11 @@ REVISED_TASKS = {
     "isochrone_service_area",
     "map_label_feature_anchoring",
     "map_text_detection_recognition_grouping",
+    "metric_distance_computation",
+    "population_density_estimation",
+    "shortest_path_optimization",
+    "spatial_graph_construction",
+    "topological_directional_reasoning",
 }
 
 
@@ -74,6 +79,29 @@ def validate_task(task_dir: Path, require_assets: bool = True) -> list[str]:
     return errors
 
 
+
+def _validate_visible_rgb(path: Path) -> str | None:
+    try:
+        import numpy as np
+        from PIL import Image
+
+        with Image.open(path) as image:
+            if image.mode != "RGB":
+                return f"expected RGB image, found {image.mode}"
+            array = np.asarray(image, dtype=np.float32)
+        if array.size == 0:
+            return "empty image"
+        spread = float(np.percentile(array, 99) - np.percentile(array, 1))
+        mean = float(array.mean())
+        if spread < 18:
+            return f"insufficient contrast ({spread:.1f})"
+        if mean < 5:
+            return f"image is nearly black (mean={mean:.1f})"
+        return None
+    except Exception as error:
+        return f"cannot inspect image: {error}"
+
+
 def _validate_revised_content(task_dir: Path, records: list[dict[str, Any]]) -> list[str]:
     name = task_dir.name
     if name not in REVISED_TASKS or not records:
@@ -111,6 +139,47 @@ def _validate_revised_content(task_dir: Path, records: list[dict[str, Any]]) -> 
         ontology = records[0].get("input", {}).get("ontology", {})
         if set(ontology) != {"A", "H", "L", "P", "R", "S", "T", "U", "V"}:
             errors.append(f"{name}: incomplete GeoNames ontology")
+
+    elif name == "metric_distance_computation":
+        units = {record.get("target", {}).get("unit_id") for record in records}
+        expected_units = {"metres", "kilometres", "miles", "nautical_miles"}
+        if units != expected_units:
+            errors.append(f"{name}: expected {sorted(expected_units)}, found {sorted(units, key=str)}")
+        for index, record in enumerate(records, 1):
+            target = record.get("target", {})
+            if not isinstance(target.get("value"), (int, float)) or not isinstance(target.get("distance_m"), (int, float)):
+                errors.append(f"{name}:{index}: missing numeric distance values")
+                break
+
+    elif name == "population_density_estimation":
+        years = {record.get("target", {}).get("year") for record in records}
+        if len(years) < 8:
+            errors.append(f"{name}: insufficient year diversity: {sorted(years, key=str)}")
+        if any(record.get("target", {}).get("indicator") != "EN.POP.DNST" for record in records):
+            errors.append(f"{name}: unexpected indicator")
+
+    elif name == "topological_directional_reasoning":
+        if any(record.get("input", {}).get("visual_geometry") != "polygon" for record in records):
+            errors.append(f"{name}: point-based or unspecified visual geometry remains")
+        if any(record.get("target", {}).get("geometry_representation") != "polygon" for record in records):
+            errors.append(f"{name}: target does not declare polygon representation")
+
+    elif name in {"spatial_graph_construction", "shortest_path_optimization"}:
+        for index, record in enumerate(records, 1):
+            images = record.get("input", {}).get("images", [])
+            if len(images) != 1 or Path(images[0]).suffix.lower() != ".png":
+                errors.append(f"{name}:{index}: input must be one display-ready PNG")
+                break
+            problem = _validate_visible_rgb(task_dir / images[0])
+            if problem:
+                errors.append(f"{name}:{index}: {problem}")
+                break
+            if name == "spatial_graph_construction" and not record.get("target", {}).get("graph_image"):
+                errors.append(f"{name}:{index}: missing graph overlay image")
+                break
+            if name == "shortest_path_optimization" and record.get("target", {}).get("unit") != "metres":
+                errors.append(f"{name}:{index}: route length unit must be metres")
+                break
 
     elif name == "isochrone_service_area":
         cities = {record.get("input", {}).get("city") for record in records}

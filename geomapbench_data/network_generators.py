@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .api_generators import WIKIMEDIA_CITIES
-from .common import N_EXAMPLES, SEEDS, base_record, copy_asset, finalize_task, stable_sample
+from .common import N_EXAMPLES, SEEDS, base_record, finalize_task, stable_sample
 
 
 OSM_LICENSE = "ODbL-1.0; maps must attribute © OpenStreetMap contributors"
@@ -319,7 +319,172 @@ def _graph_payload(graph) -> dict[str, Any]:
         {"source": index[a], "target": index[b], "length": round(float(data["length"]), 3)}
         for a, b, data in sorted(graph.edges(data=True), key=lambda e: (index[e[0]], index[e[1]]))
     ]
-    return {"directed": False, "nodes": [{"id": i, "x": p[0], "y": p[1]} for i, p in enumerate(nodes)], "edges": edges}
+    return {
+        "directed": False,
+        "nodes": [{"id": i, "x": p[0], "y": p[1]} for i, p in enumerate(nodes)],
+        "edges": edges,
+    }
+
+
+def _spacenet_display_data(source: Path, max_size: int = 1200):
+    """Read a SpaceNet raster and produce a visible 8-bit RGB rendering.
+
+    SpaceNet pan-sharpened TIFFs are commonly 11/16-bit. Copying them directly
+    makes many notebook and browser viewers render them as nearly black. This
+    helper applies a per-band 2nd--98th percentile stretch and a mild gamma
+    correction while retaining georeferencing for overlays.
+    """
+    import numpy as np
+    import rasterio
+    from affine import Affine
+    from rasterio.enums import Resampling
+
+    with rasterio.open(source) as dataset:
+        scale = min(1.0, max_size / max(dataset.width, dataset.height))
+        width = max(1, int(round(dataset.width * scale)))
+        height = max(1, int(round(dataset.height * scale)))
+        if dataset.count >= 3:
+            indexes = [1, 2, 3]
+        else:
+            indexes = [1]
+        data = dataset.read(
+            indexes,
+            out_shape=(len(indexes), height, width),
+            resampling=Resampling.bilinear,
+        ).astype("float32")
+        try:
+            valid = dataset.dataset_mask(out_shape=(height, width)) > 0
+        except TypeError:
+            valid = dataset.read_masks(1, out_shape=(height, width), resampling=Resampling.nearest) > 0
+        transform = dataset.transform * Affine.scale(dataset.width / width, dataset.height / height)
+        crs = dataset.crs
+
+    if len(indexes) == 1:
+        data = np.repeat(data, 3, axis=0)
+    finite = np.isfinite(data).all(axis=0)
+    valid = valid & finite
+    if not valid.any():
+        valid = finite
+    rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    for band_index in range(3):
+        band = data[band_index]
+        values = band[valid]
+        if values.size == 0:
+            continue
+        low, high = np.percentile(values, [2.0, 98.0])
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            low, high = float(np.nanmin(values)), float(np.nanmax(values))
+        if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+            continue
+        scaled = np.clip((band - low) / (high - low), 0.0, 1.0)
+        scaled = np.power(scaled, 0.85)  # mild brightening without saturation
+        rgb[..., band_index] = np.round(scaled * 255.0).astype(np.uint8)
+    rgb[~valid] = 0
+    return rgb, transform, crs
+
+
+def render_spacenet_display(source: Path, destination: Path, max_size: int = 1200) -> Path:
+    """Save a browser-safe RGB PNG from a high-dynamic-range SpaceNet raster."""
+    from PIL import Image
+
+    rgb, _, _ = _spacenet_display_data(source, max_size=max_size)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgb, mode="RGB").save(destination, optimize=True)
+    return destination
+
+
+def _graph_points_to_pixels(graph, transform, crs, width: int, height: int) -> dict[Any, tuple[float, float]]:
+    from pyproj import Transformer
+
+    nodes = list(graph.nodes)
+    if not nodes:
+        return {}
+    xs = [float(node[0]) for node in nodes]
+    ys = [float(node[1]) for node in nodes]
+    projected_xs, projected_ys = xs, ys
+    looks_geographic = all(-180 <= x <= 180 for x in xs) and all(-90 <= y <= 90 for y in ys)
+    if looks_geographic and crs is not None:
+        try:
+            transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            projected_xs, projected_ys = transformer.transform(xs, ys)
+        except Exception:
+            projected_xs, projected_ys = xs, ys
+
+    inverse = ~transform
+    pixels = {
+        node: tuple(float(value) for value in inverse * (x, y))
+        for node, x, y in zip(nodes, projected_xs, projected_ys)
+    }
+    inside = sum(-20 <= col <= width + 20 and -20 <= row <= height + 20 for col, row in pixels.values())
+    if inside >= max(2, int(0.5 * len(nodes))):
+        return pixels
+
+    # Fallback for releases whose label coordinates lack CRS metadata. Use the
+    # full graph extent, never route-only extent, so topology remains spatially
+    # coherent and the visualization is still useful for inspection.
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    span_x = max(max_x - min_x, 1e-9)
+    span_y = max(max_y - min_y, 1e-9)
+    margin_x = width * 0.04
+    margin_y = height * 0.04
+    return {
+        node: (
+            margin_x + (float(node[0]) - min_x) / span_x * (width - 2 * margin_x),
+            height - margin_y - (float(node[1]) - min_y) / span_y * (height - 2 * margin_y),
+        )
+        for node in nodes
+    }
+
+
+def _plot_spacenet_overlay(image_path: Path, graph, destination: Path, route: list[tuple[float, float]] | None = None) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+
+    rgb, transform, crs = _spacenet_display_data(image_path)
+    height, width = rgb.shape[:2]
+    pixel_by_node = _graph_points_to_pixels(graph, transform, crs, width, height)
+    segments = [
+        [pixel_by_node[a], pixel_by_node[b]]
+        for a, b in graph.edges
+        if a in pixel_by_node and b in pixel_by_node
+    ]
+
+    dpi = 150
+    fig, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+    ax.imshow(rgb)
+    if segments:
+        ax.add_collection(LineCollection(segments, colors="#00e5ff", linewidths=0.65, alpha=0.82))
+    if route:
+        route_pixels = [pixel_by_node[node] for node in route if node in pixel_by_node]
+        if len(route_pixels) >= 2:
+            ax.plot(
+                [point[0] for point in route_pixels],
+                [point[1] for point in route_pixels],
+                color="#ff2d2d",
+                linewidth=2.6,
+                solid_capstyle="round",
+                zorder=4,
+            )
+            ax.scatter(
+                [route_pixels[0][0], route_pixels[-1][0]],
+                [route_pixels[0][1], route_pixels[-1][1]],
+                c=["#00c853", "#2962ff"],
+                edgecolors="white",
+                linewidths=0.8,
+                s=38,
+                zorder=5,
+            )
+    ax.set_xlim(0, width)
+    ax.set_ylim(height, 0)
+    ax.set_axis_off()
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(destination, dpi=dpi, facecolor="white", pad_inches=0)
+    plt.close(fig)
 
 
 def sample_spacenet3_graph(source: Path, output: Path) -> Path:
@@ -333,8 +498,12 @@ def sample_spacenet3_graph(source: Path, output: Path) -> Path:
         if graph.number_of_edges() == 0:
             raise ValueError(f"Empty road graph for {label}")
         target_path = task_dir / "assets" / f"{i:03d}_graph.json"
+        display_path = task_dir / "assets" / f"{i:03d}_image.png"
+        overlay_path = task_dir / "assets" / f"{i:03d}_graph_overlay.png"
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(json.dumps(_graph_payload(graph), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        render_spacenet_display(image, display_path)
+        _plot_spacenet_overlay(image, graph, overlay_path)
         record = base_record(
             leaf,
             i,
@@ -346,15 +515,26 @@ def sample_spacenet3_graph(source: Path, output: Path) -> Path:
         record.update(
             {
                 "input": {
-                    "images": [copy_asset(image, task_dir / "assets", f"{i:03d}_image{image.suffix.lower()}")],
+                    "images": [display_path.relative_to(task_dir).as_posix()],
                     "question": "Extract the road centerlines and construct a routable graph with metric edge lengths.",
+                    "display_preprocessing": "per-band 2nd-98th percentile stretch with gamma 0.85",
                 },
-                "target": {"graph": target_path.relative_to(task_dir).as_posix(), "node_count": graph.number_of_nodes(), "edge_count": graph.number_of_edges()},
+                "target": {
+                    "graph": target_path.relative_to(task_dir).as_posix(),
+                    "graph_image": overlay_path.relative_to(task_dir).as_posix(),
+                    "node_count": graph.number_of_nodes(),
+                    "edge_count": graph.number_of_edges(),
+                },
                 "evaluation": {"type": "road_graph", "metrics": ["apls", "topology_f1"]},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"image_preprocessing": "8-bit RGB percentile stretch", "input_image_format": "PNG"},
+    )
 
 
 def _route_endpoints(graph):
@@ -370,24 +550,6 @@ def _route_endpoints(graph):
     return subgraph, a, b
 
 
-def _plot_route(graph, route: list[tuple[float, float]], destination: Path) -> None:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(5, 5), dpi=140)
-    for a, b in graph.edges:
-        ax.plot([a[0], b[0]], [a[1], b[1]], color="#bbbbbb", linewidth=0.5)
-    ax.plot([p[0] for p in route], [p[1] for p in route], color="#e31a1c", linewidth=2.5)
-    ax.scatter([route[0][0], route[-1][0]], [route[0][1], route[-1][1]], c=["#33a02c", "#1f78b4"], s=30)
-    ax.set_axis_off()
-    fig.tight_layout(pad=0.1)
-    fig.savefig(destination, bbox_inches="tight")
-    plt.close(fig)
-
-
 def sample_spacenet3_shortest_path(source: Path, output: Path) -> Path:
     import networkx as nx
 
@@ -401,8 +563,10 @@ def sample_spacenet3_shortest_path(source: Path, output: Path) -> Path:
         subgraph, start, end = _route_endpoints(graph)
         route = nx.shortest_path(subgraph, start, end, weight="length")
         length = nx.shortest_path_length(subgraph, start, end, weight="length")
+        display_path = task_dir / "assets" / f"{i:03d}_image.png"
         route_path = task_dir / "assets" / f"{i:03d}_route.png"
-        _plot_route(subgraph, route, route_path)
+        render_spacenet_display(image, display_path)
+        _plot_spacenet_overlay(image, subgraph, route_path, route=route)
         record = base_record(
             leaf,
             i,
@@ -414,21 +578,143 @@ def sample_spacenet3_shortest_path(source: Path, output: Path) -> Path:
         record.update(
             {
                 "input": {
-                    "images": [copy_asset(image, task_dir / "assets", f"{i:03d}_image{image.suffix.lower()}")],
+                    "images": [display_path.relative_to(task_dir).as_posix()],
                     "question": "Compute the least-distance route between the specified graph coordinates.",
                     "start": list(start),
                     "end": list(end),
+                    "display_preprocessing": "per-band 2nd-98th percentile stretch with gamma 0.85",
                 },
                 "target": {
                     "route_image": route_path.relative_to(task_dir).as_posix(),
                     "route_coordinates": [list(p) for p in route],
                     "length": round(float(length), 3),
+                    "unit": "metres",
                 },
                 "evaluation": {"type": "routing", "metrics": ["path_validity", "relative_cost_error", "apls"]},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {"image_preprocessing": "8-bit RGB percentile stretch", "input_image_format": "PNG"},
+    )
+
+
+
+def _graph_from_payload(payload: dict[str, Any]):
+    import networkx as nx
+
+    graph = nx.Graph()
+    points = {
+        int(node["id"]): (float(node["x"]), float(node["y"]))
+        for node in payload.get("nodes", [])
+    }
+    for point in points.values():
+        graph.add_node(point)
+    for edge in payload.get("edges", []):
+        source = points[int(edge["source"])]
+        target = points[int(edge["target"])]
+        graph.add_edge(source, target, length=float(edge.get("length", 0.0)))
+    return graph
+
+
+def upgrade_existing_spacenet_visuals(task_dir: Path, progress_callback=None) -> Path:
+    """Upgrade existing SpaceNet task assets without redownloading source data.
+
+    The old task folders already contain copied high-bit-depth TIFFs. This
+    function converts those files to visible PNGs, creates satellite overlays
+    for graph/route targets, rewrites paths, and refreshes the manifest.
+    """
+    import networkx as nx
+
+    from .common import DATA_REVISION, read_jsonl, sha256_file, utc_now, write_jsonl
+
+    leaf = task_dir.name
+    if leaf not in {"spatial_graph_construction", "shortest_path_optimization"}:
+        raise ValueError(f"Unsupported SpaceNet visual upgrade: {leaf}")
+    data_path = task_dir / "data.jsonl"
+    manifest_path = task_dir / "manifest.json"
+    records = read_jsonl(data_path)
+    obsolete_assets: list[Path] = []
+
+    for index, record in enumerate(records):
+        image_refs = record.get("input", {}).get("images", [])
+        if len(image_refs) != 1:
+            raise ValueError(f"{leaf}:{index + 1}: expected one input image")
+        source_image = task_dir / image_refs[0]
+        if not source_image.is_file():
+            raise FileNotFoundError(source_image)
+        already_upgraded = (
+            source_image.suffix.lower() == ".png"
+            and record.get("input", {}).get("display_preprocessing")
+            == "per-band 2nd-98th percentile stretch with gamma 0.85"
+            and (
+                (leaf == "spatial_graph_construction" and record.get("target", {}).get("graph_image"))
+                or (leaf == "shortest_path_optimization" and record.get("target", {}).get("route_image") and record.get("target", {}).get("unit") == "metres")
+            )
+        )
+        if already_upgraded:
+            if progress_callback is not None:
+                progress_callback(index + 1, len(records))
+            continue
+        display_path = task_dir / "assets" / f"{index:03d}_image.png"
+        # Avoid reading and writing the same path simultaneously.
+        if source_image.resolve() == display_path.resolve():
+            temporary = display_path.with_name(display_path.stem + "_restretched.png")
+            render_spacenet_display(source_image, temporary)
+            temporary.replace(display_path)
+        else:
+            render_spacenet_display(source_image, display_path)
+            obsolete_assets.append(source_image)
+        record["input"]["images"] = [display_path.relative_to(task_dir).as_posix()]
+        record["input"]["display_preprocessing"] = "per-band 2nd-98th percentile stretch with gamma 0.85"
+
+        if leaf == "spatial_graph_construction":
+            graph_path = task_dir / record["target"]["graph"]
+            graph = _graph_from_payload(json.loads(graph_path.read_text(encoding="utf-8")))
+            overlay_path = task_dir / "assets" / f"{index:03d}_graph_overlay.png"
+            _plot_spacenet_overlay(source_image, graph, overlay_path)
+            record["target"]["graph_image"] = overlay_path.relative_to(task_dir).as_posix()
+        else:
+            route = [tuple(float(value) for value in point) for point in record["target"].get("route_coordinates", [])]
+            if len(route) < 2:
+                raise ValueError(f"{leaf}:{index + 1}: invalid route coordinates")
+            route_graph = nx.Graph()
+            for first, second in zip(route, route[1:]):
+                route_graph.add_edge(first, second, length=_segment_length(first, second))
+            route_path = task_dir / "assets" / f"{index:03d}_route.png"
+            _plot_spacenet_overlay(source_image, route_graph, route_path, route=route)
+            record["target"]["route_image"] = route_path.relative_to(task_dir).as_posix()
+            record["target"].setdefault("unit", "metres")
+
+        if progress_callback is not None:
+            progress_callback(index + 1, len(records))
+
+    write_jsonl(data_path, records)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "data_revision": DATA_REVISION,
+            "created_at": utc_now(),
+            "count": len(records),
+            "sha256": sha256_file(data_path),
+            "image_preprocessing": "8-bit RGB percentile stretch",
+            "input_image_format": "PNG",
+        }
+    )
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    referenced = {
+        (task_dir / asset).resolve()
+        for record in records
+        for asset in record.get("input", {}).get("images", [])
+    }
+    for obsolete in obsolete_assets:
+        if obsolete.resolve() not in referenced and obsolete.exists():
+            obsolete.unlink()
+    return data_path
 
 
 def _plot_osm_isochrone(graph, center, polygon, destination: Path, show_polygon: bool) -> None:

@@ -197,6 +197,42 @@ def _render_world_pair(countries, first, second, destination: Path, first_label:
     plt.close(fig)
 
 
+DISTANCE_UNITS: dict[str, dict[str, Any]] = {
+    "metres": {
+        "question_label": "metres",
+        "target_unit": "m",
+        "metres_per_unit": 1.0,
+        "decimals": 1,
+    },
+    "kilometres": {
+        "question_label": "kilometres",
+        "target_unit": "km",
+        "metres_per_unit": 1000.0,
+        "decimals": 3,
+    },
+    "miles": {
+        "question_label": "statute miles",
+        "target_unit": "mi",
+        "metres_per_unit": 1609.344,
+        "decimals": 3,
+    },
+    "nautical_miles": {
+        "question_label": "nautical miles",
+        "target_unit": "nmi",
+        "metres_per_unit": 1852.0,
+        "decimals": 3,
+    },
+}
+
+
+def _convert_distance_from_metres(metres: float, unit_id: str) -> float:
+    """Convert a WGS84 geodesic distance to one declared output unit."""
+    if unit_id not in DISTANCE_UNITS:
+        raise ValueError(f"Unsupported distance unit: {unit_id}")
+    spec = DISTANCE_UNITS[unit_id]
+    return round(float(metres) / float(spec["metres_per_unit"]), int(spec["decimals"]))
+
+
 def generate_metric_distance(cache: Path, output: Path) -> Path:
     from pyproj import Geod
 
@@ -214,11 +250,19 @@ def generate_metric_distance(cache: Path, output: Path) -> Path:
         if key not in seen:
             seen.add(key)
             pairs.append((a, b))
+
+    # Exactly 25 examples per unit. The pairs are already deterministically
+    # shuffled, so this does not create geographic blocks by unit.
+    unit_ids = tuple(DISTANCE_UNITS)
     geod = Geod(ellps="WGS84")
     task_dir = output / leaf
     records: list[dict[str, Any]] = []
     for i, (a, b) in enumerate(pairs):
-        _, _, meters = geod.inv(a.geometry.x, a.geometry.y, b.geometry.x, b.geometry.y)
+        _, _, metres = geod.inv(a.geometry.x, a.geometry.y, b.geometry.x, b.geometry.y)
+        metres = float(abs(metres))
+        unit_id = unit_ids[i % len(unit_ids)]
+        unit_spec = DISTANCE_UNITS[unit_id]
+        value = _convert_distance_from_metres(metres, unit_id)
         name_a, name_b = _place_name(a), _place_name(b)
         image_path = task_dir / "assets" / f"{i:03d}.png"
         _render_world_pair(countries, a.geometry, b.geometry, image_path, name_a, name_b)
@@ -228,30 +272,184 @@ def generate_metric_distance(cache: Path, output: Path) -> Path:
             "Natural Earth populated places",
             "https://www.naturalearthdata.com/",
             "Public domain",
-            f"{name_a}|{name_b}",
+            f"{name_a}|{name_b}|{unit_id}",
         )
         record.update(
             {
                 "input": {
                     "images": [image_path.relative_to(task_dir).as_posix()],
-                    "question": f"What is the WGS 84 geodesic distance from A ({name_a}) to B ({name_b}) in kilometres?",
+                    "question": (
+                        f"What is the WGS 84 geodesic distance from A ({name_a}) "
+                        f"to B ({name_b}) in {unit_spec['question_label']}?"
+                    ),
                     "points": [
                         {"name": name_a, "longitude": a.geometry.x, "latitude": a.geometry.y},
                         {"name": name_b, "longitude": b.geometry.x, "latitude": b.geometry.y},
                     ],
+                    "requested_unit": unit_id,
                 },
-                "target": {"distance_km": round(meters / 1000, 3), "method": "WGS84 inverse geodesic"},
-                "evaluation": {"type": "numeric", "relative_tolerance": 0.005},
+                "target": {
+                    "value": value,
+                    "unit": unit_spec["target_unit"],
+                    "unit_id": unit_id,
+                    # Canonical values make cross-unit auditing straightforward
+                    # while the requested answer remains in target.value.
+                    "distance_m": round(metres, 3),
+                    "distance_km": round(metres / 1000.0, 6),
+                    "method": "WGS84 inverse geodesic",
+                },
+                "evaluation": {
+                    "type": "numeric",
+                    "relative_tolerance": 0.005,
+                    "unit": unit_spec["target_unit"],
+                },
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {
+            "distance_units": list(unit_ids),
+            "examples_per_unit": N_EXAMPLES // len(unit_ids),
+        },
+    )
 
 
 def _cardinal(dx: float, dy: float) -> str:
     angle = (math.degrees(math.atan2(dx, dy)) + 360) % 360
     labels = ["north", "northeast", "east", "southeast", "south", "southwest", "west", "northwest"]
     return labels[int((angle + 22.5) // 45) % 8]
+
+
+def _plot_polygon(ax, geometry, facecolor: str, edgecolor: str, alpha: float = 0.35, linewidth: float = 1.8) -> None:
+    import geopandas as gpd
+
+    gpd.GeoSeries([geometry], crs="EPSG:4326").plot(
+        ax=ax,
+        facecolor=facecolor,
+        edgecolor=edgecolor,
+        alpha=alpha,
+        linewidth=linewidth,
+    )
+
+
+def _set_geometry_bounds(ax, geometries: list[Any], padding_fraction: float = 0.15) -> None:
+    bounds = [geometry.bounds for geometry in geometries if geometry is not None and not geometry.is_empty]
+    if not bounds:
+        return
+    min_x = min(item[0] for item in bounds)
+    min_y = min(item[1] for item in bounds)
+    max_x = max(item[2] for item in bounds)
+    max_y = max(item[3] for item in bounds)
+    width = max(max_x - min_x, 0.5)
+    height = max(max_y - min_y, 0.5)
+    pad_x = width * padding_fraction
+    pad_y = height * padding_fraction
+    ax.set_xlim(max(-180, min_x - pad_x), min(180, max_x + pad_x))
+    ax.set_ylim(max(-90, min_y - pad_y), min(90, max_y + pad_y))
+
+
+def _place_area_polygon(point, country_geometry):
+    """Create a visible polygon around a place that remains inside its country."""
+    import geopandas as gpd
+
+    local_crs = gpd.GeoSeries([point], crs="EPSG:4326").estimate_utm_crs()
+    if local_crs is None:
+        return None
+    local = gpd.GeoSeries([point, country_geometry], crs="EPSG:4326").to_crs(local_crs)
+    local_point, local_country = local.iloc[0], local.iloc[1]
+    if local_country.is_empty or not local_country.is_valid:
+        local_country = local_country.buffer(0)
+    clearance = float(local_point.distance(local_country.boundary))
+    if not math.isfinite(clearance) or clearance <= 100:
+        return None
+
+    # Use a 12-sided polygon rather than an ambiguous point marker. The radius
+    # adapts to border clearance and is capped to keep the highlighted area local.
+    radius = min(20_000.0, max(750.0, clearance * 0.35))
+    candidate = local_point.buffer(radius, quad_segs=3)
+    for _ in range(6):
+        if candidate.within(local_country):
+            return gpd.GeoSeries([candidate], crs=local_crs).to_crs(4326).iloc[0]
+        radius *= 0.5
+        candidate = local_point.buffer(radius, quad_segs=3)
+    return None
+
+
+def _render_within_polygons(countries, area_a, country_b, destination: Path, place_name: str, country_name: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.8), dpi=150)
+
+    # Country-level view.
+    ax = axes[0]
+    countries.boundary.plot(ax=ax, color="#c7c7c7", linewidth=0.3)
+    _plot_polygon(ax, country_b, "#80b1d3", "#1f78b4", alpha=0.28, linewidth=1.6)
+    _plot_polygon(ax, area_a, "#fb8072", "#d7301f", alpha=0.8, linewidth=2.0)
+    _set_geometry_bounds(ax, [country_b], 0.12)
+    pa = area_a.representative_point()
+    pb = country_b.representative_point()
+    ax.annotate("A", (pa.x, pa.y), ha="center", va="center", fontsize=11, weight="bold", color="#7f0000",
+                bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#d7301f", "pad": 1.5})
+    ax.annotate("B", (pb.x, pb.y), ha="center", va="center", fontsize=11, weight="bold", color="#084594",
+                bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#1f78b4", "pad": 1.5})
+    ax.set_title(f"Country context: B = {country_name}", fontsize=9)
+    ax.set_axis_off()
+
+    # Local view makes polygon A clearly distinguishable from a point.
+    ax = axes[1]
+    _plot_polygon(ax, country_b, "#deebf7", "#1f78b4", alpha=0.45, linewidth=1.3)
+    _plot_polygon(ax, area_a, "#fb8072", "#d7301f", alpha=0.9, linewidth=2.4)
+    min_x, min_y, max_x, max_y = area_a.bounds
+    width = max(max_x - min_x, 0.03)
+    height = max(max_y - min_y, 0.03)
+    ax.set_xlim(min_x - width * 4, max_x + width * 4)
+    ax.set_ylim(min_y - height * 4, max_y + height * 4)
+    ax.annotate("A", (pa.x, pa.y), ha="center", va="center", fontsize=12, weight="bold", color="#7f0000",
+                bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#d7301f", "pad": 1.5})
+    ax.text(0.02, 0.98, "Blue area = polygon B", transform=ax.transAxes, va="top", fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#1f78b4", "pad": 2})
+    ax.set_title(f"Local view: A = area around {place_name}", fontsize=9)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_axis_off()
+
+    fig.suptitle("Determine the relation between polygon A and polygon B", fontsize=11, weight="bold")
+    fig.tight_layout(pad=0.6)
+    fig.savefig(destination, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def _render_direction_polygons(countries, geometry_a, geometry_b, destination: Path, name_a: str, name_b: str) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7.5, 5.2), dpi=150)
+    countries.boundary.plot(ax=ax, color="#d0d0d0", linewidth=0.3)
+    _plot_polygon(ax, geometry_a, "#fb8072", "#d7301f", alpha=0.75, linewidth=2.0)
+    _plot_polygon(ax, geometry_b, "#80b1d3", "#1f78b4", alpha=0.65, linewidth=2.0)
+    _set_geometry_bounds(ax, [geometry_a, geometry_b], 0.18)
+
+    pa = geometry_a.representative_point()
+    pb = geometry_b.representative_point()
+    ax.annotate("A", (pa.x, pa.y), ha="center", va="center", fontsize=12, weight="bold", color="#7f0000",
+                bbox={"facecolor": "white", "alpha": 0.92, "edgecolor": "#d7301f", "pad": 1.8})
+    ax.annotate("B", (pb.x, pb.y), ha="center", va="center", fontsize=12, weight="bold", color="#084594",
+                bbox={"facecolor": "white", "alpha": 0.92, "edgecolor": "#1f78b4", "pad": 1.8})
+    ax.set_title(f"A: {name_a}     B: {name_b}", fontsize=10, weight="bold")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_axis_off()
+    fig.tight_layout(pad=0.4)
+    fig.savefig(destination, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
 
 
 def generate_topology_direction(cache: Path, output: Path) -> Path:
@@ -261,9 +459,40 @@ def generate_topology_direction(cache: Path, output: Path) -> Path:
     countries, places = natural_earth(cache)
     countries = countries[countries.geometry.notna() & ~countries.geometry.is_empty].copy()
     places = places[places.geometry.notna() & ~places.geometry.is_empty].copy()
+
+    # Exclude very small regions that remain difficult to distinguish even when
+    # plotted as polygons. Area is measured in an equal-area CRS.
+    country_areas = countries.to_crs(6933).geometry.area
+    countries = countries[country_areas >= 10_000_000_000].copy()  # 10,000 km²
+    countries = countries.sort_values("ADMIN").drop_duplicates("ADMIN")
+
     joined = gpd.sjoin(places, countries[["geometry", "ADMIN"]], predicate="within", how="inner")
     within_rows = [row for _, row in joined.iterrows()]
-    within_selected = stable_sample(within_rows, 50, SEEDS[leaf], key=lambda row: f"{_place_name(row)}:{row.get('ADMIN','')}")
+    candidate_count = min(len(within_rows), 500)
+    ordered_candidates = stable_sample(
+        within_rows,
+        candidate_count,
+        SEEDS[leaf],
+        key=lambda row: f"{_place_name(row)}:{row.get('ADMIN', '')}",
+    )
+    within_candidates: list[tuple[Any, Any, Any]] = []
+    country_lookup = {str(row["ADMIN"]): row for _, row in countries.iterrows()}
+    for row in ordered_candidates:
+        country_name = str(row["ADMIN"])
+        country = country_lookup.get(country_name)
+        if country is None:
+            continue
+        area_polygon = _place_area_polygon(row.geometry, country.geometry)
+        if area_polygon is not None and not area_polygon.is_empty:
+            within_candidates.append((row, country, area_polygon))
+        if len(within_candidates) >= 120:
+            break
+    within_selected = stable_sample(
+        within_candidates,
+        50,
+        SEEDS[leaf] + 7,
+        key=lambda item: f"{_place_name(item[0])}:{item[1]['ADMIN']}",
+    )
 
     country_rows = [row for _, row in countries.iterrows()]
     rng = random.Random(SEEDS[leaf] + 1)
@@ -272,37 +501,53 @@ def generate_topology_direction(cache: Path, output: Path) -> Path:
     while len(pair_rows) < 50:
         a, b = rng.sample(country_rows, 2)
         key = tuple(sorted((_country_name(a), _country_name(b))))
-        if key not in seen:
-            seen.add(key)
-            pair_rows.append((a, b))
+        if key in seen:
+            continue
+        if a.geometry.intersects(b.geometry) and not a.geometry.touches(b.geometry):
+            continue
+        seen.add(key)
+        pair_rows.append((a, b))
 
     task_dir = output / leaf
     records: list[dict[str, Any]] = []
-    mixed: list[tuple[str, Any]] = [("within", x) for x in within_selected] + [("direction", x) for x in pair_rows]
+    mixed: list[tuple[str, Any]] = [("within", item) for item in within_selected] + [("direction", item) for item in pair_rows]
     rng.shuffle(mixed)
     for i, (kind, item) in enumerate(mixed):
+        image_path = task_dir / "assets" / f"{i:03d}.png"
         if kind == "within":
-            row = item
-            place_name, country_name = _place_name(row), str(row["ADMIN"])
-            country = countries[countries["ADMIN"] == country_name].iloc[0]
-            image_path = task_dir / "assets" / f"{i:03d}.png"
-            _render_world_pair(countries, row.geometry, country.geometry.representative_point(), image_path, place_name, country_name)
-            question = f"Is point A ({place_name}) within region B ({country_name})?"
-            target = {"relation": "within", "answer": "yes"}
-            group_id = country_name
+            row, country, area_a = item
+            place_name, country_name = _place_name(row), str(country["ADMIN"])
+            _render_within_polygons(countries, area_a, country.geometry, image_path, place_name, country_name)
+            question = (
+                f"Is polygon A (the highlighted area around {place_name}) completely within "
+                f"polygon B ({country_name})?"
+            )
+            target = {
+                "relation": "within",
+                "answer": "yes",
+                "region_a_name": f"area around {place_name}",
+                "region_b_name": country_name,
+                "geometry_representation": "polygon",
+            }
+            group_id = f"within:{country_name}:{place_name}"
         else:
             a, b = item
             pa, pb = a.geometry.representative_point(), b.geometry.representative_point()
             relation = "touches" if a.geometry.touches(b.geometry) else _cardinal(pa.x - pb.x, pa.y - pb.y)
             name_a, name_b = _country_name(a), _country_name(b)
-            image_path = task_dir / "assets" / f"{i:03d}.png"
-            _render_world_pair(countries, pa, pb, image_path, name_a, name_b)
+            _render_direction_polygons(countries, a.geometry, b.geometry, image_path, name_a, name_b)
             if relation == "touches":
-                question = f"What topological relation holds between A ({name_a}) and B ({name_b})?"
+                question = f"What topological relation holds between polygon A ({name_a}) and polygon B ({name_b})?"
             else:
-                question = f"What is the approximate cardinal direction of A ({name_a}) relative to B ({name_b})?"
-            target = {"relation": relation, "answer": relation}
-            group_id = f"{name_a}|{name_b}"
+                question = f"What is the approximate cardinal direction of polygon A ({name_a}) relative to polygon B ({name_b})?"
+            target = {
+                "relation": relation,
+                "answer": relation,
+                "region_a_name": name_a,
+                "region_b_name": name_b,
+                "geometry_representation": "polygon",
+            }
+            group_id = f"direction:{name_a}|{name_b}"
         record = base_record(
             leaf,
             i,
@@ -313,13 +558,27 @@ def generate_topology_direction(cache: Path, output: Path) -> Path:
         )
         record.update(
             {
-                "input": {"images": [image_path.relative_to(task_dir).as_posix()], "question": question},
+                "input": {
+                    "images": [image_path.relative_to(task_dir).as_posix()],
+                    "question": question,
+                    "visual_geometry": "polygon",
+                    "labels": {"A": target["region_a_name"], "B": target["region_b_name"]},
+                },
                 "target": target,
                 "evaluation": {"type": "relation_classification", "metric": "accuracy"},
             }
         )
         records.append(record)
-    return finalize_task(output, leaf, records)
+    return finalize_task(
+        output,
+        leaf,
+        records,
+        {
+            "visual_geometry": "polygon",
+            "within_examples": 50,
+            "directional_examples": 50,
+        },
+    )
 
 
 GEONAMES_COUNTRIES = ["CH", "IS", "NZ", "KE", "PE", "NP", "MA", "JP", "ZA", "ID"]

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 — July 2026 additional data-quality fixes
+
+Five additional leaves must be refreshed when upgrading from 1.1.0:
+
+- `metric_distance_computation`
+- `population_density_estimation`
+- `shortest_path_optimization`
+- `spatial_graph_construction`
+- `topological_directional_reasoning`
+
+### Corrections
+
+- Balanced metric-distance answers across metres, kilometres, statute miles, and nautical miles while retaining canonical metre/kilometre targets for auditability.
+- Balanced population-density examples across nine World Bank years: 2000, 2005, 2010, 2015, 2018, 2020, 2021, 2022, and 2023.
+- Added percentile-stretched 8-bit RGB SpaceNet inputs so notebook and browser viewers do not display high-bit-depth TIFFs as black.
+- Added road-graph and shortest-route overlays over the satellite imagery.
+- Replaced ambiguous point markers in topological/directional reasoning with filled polygon A/B regions and a two-scale within-region visualization.
+- Added an in-place SpaceNet visual migration that reuses existing task assets and does not require redownloading SpaceNet 3.
+
 ## 1.1.0 — July 2026 benchmark-quality revision
 
 The following eight leaves must be regenerated when upgrading from 1.0.0:

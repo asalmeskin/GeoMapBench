@@ -2,9 +2,9 @@
 
 This package builds **exactly 100 deterministic examples for each of 23 leaves** in the revised GeoMapBench taxonomy. It does not bundle multi-gigabyte upstream imagery or silently relicense it. Instead, it supplies official source links, download helpers, fixed per-leaf seeds, source-specific samplers, public-API generators, cached raw responses, provenance, and validation.
 
-## July 2026 quality revision
+## July 2026 quality revisions
 
-Release `1.1.0` directly corrects eight benchmark-design problems:
+Release `1.2.0` includes the original eight `1.1.0` corrections plus five additional benchmark-quality fixes:
 
 - Coordinate transformation now balances six reversible transformation modes instead of always starting in WGS 84 and ending in local UTM.
 - Cross-entity comparison spans nine years, four World Bank indicators, and both higher/lower comparisons.
@@ -14,10 +14,14 @@ Release `1.1.0` directly corrects eight benchmark-design problems:
 - OSM isochrones cover 20 globally distributed cities, multiple time budgets and walking speeds, and use buffered reachable street edges instead of a convex hull.
 - Map-label anchoring hides candidate names and displays the target label at its actual anchor position over four nearby candidate geometries.
 - Map-text examples require detection, transcription, and grouping of every visible word in a crop, with at least two label groups per example.
+- Metric-distance questions are balanced across metres, kilometres, statute miles, and nautical miles instead of always requesting kilometres.
+- Population-density questions span nine World Bank reference years from 2000 through 2023.
+- SpaceNet 3 graph and route inputs are converted from high-bit-depth TIFFs to contrast-stretched RGB PNGs; graph and route overlays are rendered over the satellite image.
+- Topological/directional reasoning uses clearly filled polygon regions rather than ambiguous point markers.
 
-The validator enforces these properties for the eight revised leaves. Their manifests contain `data_revision = "2026-07-comments-v2"`.
+The validator enforces these properties for the thirteen revised leaves. Their manifests contain `data_revision = "2026-07-comments-v2"`.
 
-A minimal Colab that rebuilds **only these eight leaves** is included at [`notebooks/GeoMapBench_fixed_tasks_colab.ipynb`](notebooks/GeoMapBench_fixed_tasks_colab.ipynb). The other 15 task generators are intentionally not called.
+The original eight-task Colab remains at [`notebooks/GeoMapBench_fixed_tasks_colab.ipynb`](notebooks/GeoMapBench_fixed_tasks_colab.ipynb). A second notebook, [`notebooks/GeoMapBench_additional_fixes_colab.ipynb`](notebooks/GeoMapBench_additional_fixes_colab.ipynb), rebuilds the three lightweight public-data tasks and upgrades the two existing SpaceNet folders in place without redownloading SpaceNet.
 
 ## Taxonomy decisions
 
@@ -144,7 +148,7 @@ geomapbench-data environmental-layer \
 
 `--koppen-raster` remains accepted only as a deprecated compatibility argument and is not needed by the revised task.
 
-## Rebuild only the eight revised leaves
+## Rebuild the original eight revised leaves
 
 Existing unaffected task directories do not need regeneration:
 
@@ -158,6 +162,19 @@ geomapbench-data environmental-layer --cache "$CACHE" --output "$OUT"
 geomapbench-data osm-label-anchoring --cache "$CACHE" --output "$OUT"
 geomapbench-data osm-isochrone --cache "$CACHE" --output "$OUT"
 ```
+
+
+## Apply only the five additional 1.2.0 fixes
+
+The metric-distance, population-density, and topology/direction tasks can be regenerated from lightweight cached public sources:
+
+```bash
+geomapbench-data metric-distance --cache "$CACHE" --output "$OUT"
+geomapbench-data population-density --cache "$CACHE" --output "$OUT"
+geomapbench-data topology-direction --cache "$CACHE" --output "$OUT"
+```
+
+For existing SpaceNet 3 task folders, `upgrade_existing_spacenet_visuals` reuses the copied TIFFs already stored in each task and converts them to display-ready PNGs while producing satellite graph/route overlays. The additional-fixes Colab performs this operation through a validated staging directory, so the multi-gigabyte source release is not downloaded again.
 
 ## Validate
 
