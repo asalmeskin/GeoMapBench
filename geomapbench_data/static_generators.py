@@ -552,61 +552,247 @@ def _render_environmental_patch(patch, destination: Path) -> dict[str, float]:
     }
 
 
-def generate_environmental_layer(cache: Path, koppen_raster: Path | None, output: Path) -> Path:
+def generate_environmental_layer(
+    cache: Path,
+    koppen_raster: Path | None,
+    output: Path,
+) -> Path:
     """Build a balanced multi-layer identification task.
 
-    ``koppen_raster`` is retained as a deprecated positional argument for CLI/API
-    compatibility. The revised task uses six official WorldClim layers so the
-    target is no longer constant.
+    Invalid coastal or boundary locations are skipped deterministically rather
+    than aborting the entire generation process.
+
+    ``koppen_raster`` is retained only for CLI/API compatibility.
     """
+
     leaf = "environmental_layer_identification"
+
     _, places = natural_earth(cache)
+
     rows = [
         row
         for _, row in places.iterrows()
-        if row.geometry and not row.geometry.is_empty and abs(float(row.geometry.y)) <= 70
+        if (
+            row.geometry
+            and not row.geometry.is_empty
+            and abs(float(row.geometry.y)) <= 70
+        )
     ]
+
+    if len(rows) < N_EXAMPLES:
+        raise RuntimeError(
+            f"Only {len(rows)} populated-place candidates were found."
+        )
+
     layer_paths = _worldclim_layer_paths(cache)
-    groups = {layer_id: rows for layer_id in ENVIRONMENTAL_LAYERS}
-    selected = balanced_sample(
-        groups,
+
+    layer_ids = sorted(ENVIRONMENTAL_LAYERS)
+
+    # 100 examples over 6 classes:
+    # 17, 17, 17, 17, 16, 16.
+    base_quota, remainder = divmod(
         N_EXAMPLES,
-        SEEDS[leaf],
-        key=lambda row: f"{_place_name(row)}:{row.geometry.x:.5f}:{row.geometry.y:.5f}",
+        len(layer_ids),
     )
-    choices = [ENVIRONMENTAL_LAYERS[layer_id]["label"] for layer_id in sorted(ENVIRONMENTAL_LAYERS)]
+
+    quotas = {
+        layer_id: base_quota + int(index < remainder)
+        for index, layer_id in enumerate(layer_ids)
+    }
+
+    candidate_key = lambda row: (
+        f"{_place_name(row)}:"
+        f"{float(row.geometry.x):.6f}:"
+        f"{float(row.geometry.y):.6f}"
+    )
+
+    selected_examples: list[dict[str, Any]] = []
+    rejected_by_layer: dict[str, int] = {}
+    used_locations: set[str] = set()
+
+    for layer_index, layer_id in enumerate(layer_ids):
+        spec = ENVIRONMENTAL_LAYERS[layer_id]
+        quota = quotas[layer_id]
+
+        candidates = sorted(
+            rows,
+            key=candidate_key,
+        )
+
+        # Different deterministic ordering for each layer.
+        rng = random.Random(
+            SEEDS[leaf] + 1009 * (layer_index + 1)
+        )
+        rng.shuffle(candidates)
+
+        accepted = 0
+        rejected = 0
+        last_rejections: list[str] = []
+
+        print(
+            f"Selecting {quota} valid examples for "
+            f"{layer_id}...",
+            flush=True,
+        )
+
+        for row in candidates:
+            place = _place_name(row)
+            lon = float(row.geometry.x)
+            lat = float(row.geometry.y)
+
+            location_key = (
+                f"{place}:{lon:.6f}:{lat:.6f}"
+            )
+
+            # Keep all 100 benchmark locations distinct.
+            if location_key in used_locations:
+                continue
+
+            try:
+                patch = _read_environmental_patch(
+                    layer_paths[layer_id],
+                    lon,
+                    lat,
+                    spec["scale"],
+                )
+
+            except ValueError as error:
+                # Expected for coastal places, islands, or locations
+                # close to a raster boundary.
+                rejected += 1
+
+                if len(last_rejections) < 10:
+                    last_rejections.append(
+                        f"{place} ({lat:.5f}, {lon:.5f}): "
+                        f"{error}"
+                    )
+
+                continue
+
+            selected_examples.append(
+                {
+                    "layer_id": layer_id,
+                    "row": row,
+                    "patch": patch,
+                    "place": place,
+                    "longitude": lon,
+                    "latitude": lat,
+                }
+            )
+
+            used_locations.add(location_key)
+            accepted += 1
+
+            if accepted == quota:
+                break
+
+        rejected_by_layer[layer_id] = rejected
+
+        if accepted != quota:
+            details = "\n".join(last_rejections)
+
+            raise RuntimeError(
+                f"Could generate only {accepted}/{quota} valid "
+                f"examples for {layer_id}.\n"
+                f"Rejected candidates: {rejected}\n"
+                f"Recent rejection reasons:\n{details}"
+            )
+
+        print(
+            f"  Accepted: {accepted} | "
+            f"Skipped invalid locations: {rejected}",
+            flush=True,
+        )
+
+    if len(selected_examples) != N_EXAMPLES:
+        raise RuntimeError(
+            f"Expected {N_EXAMPLES} selected examples, "
+            f"found {len(selected_examples)}."
+        )
+
+    # Mix classes in deterministic order rather than storing them
+    # in six contiguous class blocks.
+    random.Random(SEEDS[leaf]).shuffle(
+        selected_examples
+    )
+
+    choices = [
+        ENVIRONMENTAL_LAYERS[layer_id]["label"]
+        for layer_id in layer_ids
+    ]
+
     templates = (
-        "Which environmental variable is represented by this raster patch around {place}?",
-        "Identify the environmental layer visualized for the region centred on {place}.",
+        "Which environmental variable is represented by this "
+        "raster patch around {place}?",
+        "Identify the environmental layer visualized for the "
+        "region centred on {place}.",
         "What type of environmental raster is shown near {place}?",
-        "Select the variable mapped in this unlabeled raster around {place}.",
+        "Select the variable mapped in this unlabeled raster "
+        "around {place}.",
     )
+
     task_dir = output / leaf
     records: list[dict[str, Any]] = []
-    for i, (layer_id, row) in enumerate(selected):
+
+    for index, example in enumerate(selected_examples):
+        layer_id = example["layer_id"]
         spec = ENVIRONMENTAL_LAYERS[layer_id]
-        lon, lat = float(row.geometry.x), float(row.geometry.y)
-        patch = _read_environmental_patch(layer_paths[layer_id], lon, lat, spec["scale"])
-        image_path = task_dir / "assets" / f"{i:03d}_{layer_id}.png"
-        statistics = _render_environmental_patch(patch, image_path)
-        place = _place_name(row)
+
+        place = example["place"]
+        lon = example["longitude"]
+        lat = example["latitude"]
+        patch = example["patch"]
+
+        image_path = (
+            task_dir
+            / "assets"
+            / f"{index:03d}_{layer_id}.png"
+        )
+
+        statistics = _render_environmental_patch(
+            patch,
+            image_path,
+        )
+
         answer = spec["label"]
+
         record = base_record(
             leaf,
-            i,
+            index,
             "WorldClim 2.1 global climate and elevation rasters",
             "https://www.worldclim.org/data/worldclim21.html",
-            "WorldClim data license; free for research and related activities",
-            f"{layer_id}:{place}",
+            (
+                "WorldClim data license; free for research "
+                "and related activities"
+            ),
+            (
+                f"{layer_id}:{place}:"
+                f"{lon:.5f}:{lat:.5f}"
+            ),
         )
+
         record.update(
             {
                 "input": {
-                    "images": [image_path.relative_to(task_dir).as_posix()],
-                    "question": templates[i % len(templates)].format(place=place),
+                    "images": [
+                        image_path.relative_to(
+                            task_dir
+                        ).as_posix()
+                    ],
+                    "question": templates[
+                        index % len(templates)
+                    ].format(place=place),
                     "choices": choices,
-                    "coordinate": {"longitude": lon, "latitude": lat, "crs": "EPSG:4326"},
-                    "note": "The colorbar is intentionally unlabeled; infer the layer from its values and spatial pattern.",
+                    "coordinate": {
+                        "longitude": lon,
+                        "latitude": lat,
+                        "crs": "EPSG:4326",
+                    },
+                    "note": (
+                        "The colorbar is intentionally unlabeled; "
+                        "infer the layer from its values and "
+                        "spatial pattern."
+                    ),
                 },
                 "target": {
                     "answer": answer,
@@ -615,15 +801,53 @@ def generate_environmental_layer(cache: Path, koppen_raster: Path | None, output
                     "unit": spec["unit"],
                     "summary_statistics": statistics,
                 },
-                "evaluation": {"type": "classification", "metrics": ["accuracy", "macro_f1"]},
+                "evaluation": {
+                    "type": "classification",
+                    "metrics": [
+                        "accuracy",
+                        "macro_f1",
+                    ],
+                },
             }
         )
+
         records.append(record)
-    distribution = {layer_id: sum(r["target"]["layer_id"] == layer_id for r in records) for layer_id in ENVIRONMENTAL_LAYERS}
+
+    distribution = {
+        layer_id: sum(
+            record["target"]["layer_id"] == layer_id
+            for record in records
+        )
+        for layer_id in layer_ids
+    }
+
+    if sum(distribution.values()) != N_EXAMPLES:
+        raise RuntimeError(
+            f"Invalid final distribution: {distribution}"
+        )
+
+    if max(distribution.values()) - min(
+        distribution.values()
+    ) > 1:
+        raise RuntimeError(
+            f"Unbalanced final distribution: {distribution}"
+        )
+
     return finalize_task(
         output,
         leaf,
         records,
-        {"layer_distribution": distribution, "deprecated_koppen_argument_used": koppen_raster is not None},
+        {
+            "layer_distribution": distribution,
+            "invalid_location_rejections": (
+                rejected_by_layer
+            ),
+            "unique_location_count": len(
+                used_locations
+            ),
+            "deprecated_koppen_argument_used": (
+                koppen_raster is not None
+            ),
+        },
     )
 
