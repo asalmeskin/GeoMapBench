@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geomapbench-data-kit"
-version = "1.3.1"
-description = "Deterministic GeoMapBench builders with optional Bloom-balanced evaluation overlays"
+version = "1.4.0"
+description = "Deterministic GeoMapBench builders plus a large resume-safe GeoMapRAG corpus pipeline"
 requires-python = ">=3.10"
 dependencies = [
   "geopandas>=1.0,<2",
@@ -15,15 +15,26 @@ dependencies = [
   "numpy>=1.26,<3",
   "osmnx>=2.0,<3",
   "pandas>=2.1,<3",
-  "Pillow>=10.2,<13",
+  "Pillow>=11.3,<12",
   "pyproj>=3.6,<4",
   "rasterio>=1.3,<2",
-  "shapely>=2.0,<3"
+  "requests>=2.32,<3",
+  "shapely>=2.0,<3",
+  "tqdm>=4.66,<5"
 ]
+
+[project.optional-dependencies]
+rag-index = [
+  "faiss-cpu>=1.11,<2",
+  "sentence-transformers>=5.0,<6",
+  "transformers>=4.55,<5"
+]
+test = ["pytest>=8,<9"]
 
 [project.scripts]
 geomapbench-data = "geomapbench_data.cli:main"
+geomaprag-data = "geomaprag_data.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["geomapbench_data*"]
+include = ["geomapbench_data*", "geomaprag_data*"]
 

@@ -12,6 +12,7 @@ from .api_generators import (
     generate_visual_geolocation,
 )
 from .common import SEEDS
+from .clean_data import main as clean_data_main
 from .bloom import BLOOM_LEVELS, bloom_audit_root, bloomify_root, restore_bloom_root
 from .download import download_zenodo, extract_zip
 from .network_generators import (
@@ -100,6 +101,13 @@ def make_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("seeds")
 
+    clean = sub.add_parser("clean", help="Create model-facing data_clean.jsonl sidecars without modifying benchmark originals.")
+    clean.add_argument("--root", type=_path, required=True)
+    clean.add_argument("--overwrite", action="store_true")
+    clean.add_argument("--no-provenance", action="store_true")
+    clean.add_argument("--dry-run", action="store_true")
+    clean.add_argument("--allow-non100", action="store_true")
+
     bloomify = sub.add_parser("bloomify", help="Convert an existing 23-leaf GeoMapBench release into a balanced Bloom variant in place without changing assets.")
     bloomify.add_argument("--root", type=_path, required=True)
     bloomify.add_argument("--no-backup", action="store_true", help="Do not save the original data.jsonl/manifest.json under each leaf's .pre_bloom directory.")
@@ -125,6 +133,17 @@ def main(argv: list[str] | None = None) -> int:
     if command == "seeds":
         print(json.dumps(SEEDS, indent=2, sort_keys=True))
         return 0
+    if command == "clean":
+        clean_argv = ["--root", str(args.root)]
+        if args.overwrite:
+            clean_argv.append("--overwrite")
+        if args.no_provenance:
+            clean_argv.append("--no-provenance")
+        if args.dry_run:
+            clean_argv.append("--dry-run")
+        if args.allow_non100:
+            clean_argv.append("--allow-non100")
+        return clean_data_main(clean_argv)
     if command == "validate":
         errors = validate_root(args.root, require_all=args.require_all, require_assets=not args.skip_assets)
         if errors:

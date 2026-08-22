@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GeoMapRAG corpus record",
+  "type": "object",
+  "required": ["id", "dataset", "data_revision", "group_id", "source", "input", "retrieval", "provenance"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "dataset": {"const": "GeoMapRAG"},
+    "data_revision": {"type": "string", "minLength": 1},
+    "group_id": {"type": "string"},
+    "source": {
+      "type": "object",
+      "required": ["name", "url", "license"],
+      "properties": {
+        "name": {"type": "string"},
+        "url": {"type": "string"},
+        "license": {"type": "string"},
+        "attribution": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "input": {
+      "type": "object",
+      "required": ["modality", "title", "text"],
+      "properties": {
+        "modality": {"enum": ["text", "structured", "map_image", "geo_image"]},
+        "title": {"type": "string"},
+        "text": {"type": "string", "minLength": 20},
+        "images": {"type": "array", "items": {"type": "string"}},
+        "geo": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "retrieval": {
+      "type": "object",
+      "required": ["document_type", "capabilities"],
+      "properties": {
+        "document_type": {"type": "string"},
+        "capabilities": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": true
+    },
+    "provenance": {"type": "object"},
+    "extra": {"type": "object"}
+  },
+  "additionalProperties": true
+}

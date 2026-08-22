@@ -5,7 +5,7 @@ This package builds **exactly 100 deterministic examples for each of 23 leaves**
 
 ## August 2026 Bloom-balanced benchmark overlay
 
-Release `1.3.1` includes the Bloom-balanced conversion introduced in 1.3.0 and adds robust canonical-leaf validation. It adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
+Release `1.4.0` retains the Bloom-balanced conversion and robust canonical-leaf validation from 1.3.x, and adds the large resume-safe GeoMapRAG corpus pipeline described below. It adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
 
 The conversion is intentionally lightweight: it rewrites only `data.jsonl` and `manifest.json`, preserves all original target fields, adds `target.bloom_answer`, and stores the original two metadata files under `.pre_bloom/`. It does not redownload OpenEarthMap, SpaceNet, MapText, or any other upstream source.
 
@@ -242,3 +242,36 @@ Do not randomly split individual questions after generating Bloom variants. Spli
 - GeoWebNews is openly released in a GPL repository, but underlying corpus notices still need review before republishing text.
 - This package is an engineering aid, not legal advice.
 
+
+---
+
+## Large GeoMapRAG retrieval corpus (v1.4.0)
+
+This repository now also contains `geomaprag_data/`, a large, resume-safe retrieval-corpus builder designed to complement GeoMapBench evaluation. The full design and commands are documented in [`GEOMAPRAG_DATA.md`](GEOMAPRAG_DATA.md), and the ready-to-run Colab is [`notebooks/GeoMapRAG_Corpus_Colab.ipynb`](notebooks/GeoMapRAG_Corpus_Colab.ipynb).
+
+The `iclr` profile expands the original 6,649-record prototype using Wikipedia, Wikidata/QLever, GeoNames, World Bank, EPSG/PROJ, and OpenStreetMap. It targets a healthy corpus in the tens of thousands of records with hundreds to roughly one thousand unlabeled metric map crops. Each network unit is committed as an atomic shard, so interrupted Colab runs can resume without discarding completed work. A benchmark-overlap guard filters exact text/source identifiers and nearby coordinates before RAG records are admitted.
+
+```bash
+geomaprag-data migrate \
+  --old-root /content/drive/MyDrive/GeoMapRAG_Corpus_v1 \
+  --new-root /content/drive/MyDrive/GeoMapRAG_Corpus
+
+geomaprag-data build \
+  --output /content/drive/MyDrive/GeoMapRAG_Corpus \
+  --benchmark-root /content/drive/MyDrive/GeoMapBench_Data/geomapbench_100 \
+  --profile iclr
+
+geomaprag-data validate \
+  --root /content/drive/MyDrive/GeoMapRAG_Corpus \
+  --profile iclr
+
+geomaprag-data clean \
+  --root /content/drive/MyDrive/GeoMapRAG_Corpus \
+  --overwrite
+```
+
+The benchmark cleaner was moved into `geomapbench_data/clean_data.py` and is now available through the package CLI:
+
+```bash
+geomapbench-data clean --root /path/to/geomapbench_100 --overwrite
+```

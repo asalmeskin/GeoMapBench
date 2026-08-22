@@ -1,0 +1,8 @@
+source,role,license,upstream_url,primary_capabilities
+Wikipedia,encyclopedic geographic context,CC BY-SA 4.0 / GFDL,https://en.wikipedia.org/,geographic_fact_reasoning|toponym_recognition|geo_entity_typing|geologic_geomorphic_interpretation
+Wikidata,typed geographic entities and coordinates,CC0 1.0,https://www.wikidata.org/,geo_entity_typing|toponym_recognition|cross_entity_comparison|geographic_fact_reasoning
+GeoNames,global gazetteer and alternate names,CC BY 4.0,https://www.geonames.org/,toponym_recognition|geo_entity_typing|geographic_fact_reasoning
+World Bank,country-year quantitative indicators,CC BY 4.0,https://data.worldbank.org/,population_density_estimation|cross_entity_comparison|geographic_fact_reasoning
+EPSG / PROJ,coordinate reference system metadata,EPSG terms / PROJ redistribution terms,https://epsg.org/,coordinate_transformation|metric_distance_computation
+OpenStreetMap,spatial features and unlabeled map crops,ODbL 1.0,https://www.openstreetmap.org/,map_label_feature_anchoring|metric_distance_computation|topological_directional_reasoning|spatial_graph_construction|shortest_path_optimization|isochrone_service_area|visual_geolocation
+Wikimedia Commons,license-filtered geocoded ground photographs,Per-image CC0/PD/CC BY/CC BY-SA,https://commons.wikimedia.org/,visual_geolocation|geographic_fact_reasoning
