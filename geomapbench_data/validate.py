@@ -14,7 +14,6 @@ REVISED_TASKS = {
     "dense_land_cover_labeling",
     "environmental_layer_identification",
     "geo_entity_typing",
-    "isochrone_service_area",
     "map_label_feature_anchoring",
     "map_text_detection_recognition_grouping",
     "metric_distance_computation",
@@ -277,13 +276,36 @@ def _validate_bloom_content(
 
 
 def validate_root(root: Path, require_all: bool = False, require_assets: bool = True) -> list[str]:
+    """Validate canonical GeoMapBench leaves only.
+
+    Google Drive and similar sync/copy workflows can create sibling directories
+    such as ``dense_land_cover_labeling (1)``.  Those directories are not part
+    of the benchmark taxonomy and must not be interpreted as additional leaves.
+
+    The canonical leaf set is defined by ``SEEDS``.  Extra task-like sibling
+    directories are deliberately ignored; missing canonical leaves are reported
+    when ``require_all`` is enabled.
+    """
+    root = Path(root)
+    if not root.exists():
+        return [f"Dataset root does not exist: {root}"]
+    if not root.is_dir():
+        return [f"Dataset root is not a directory: {root}"]
+
+    canonical = set(SEEDS)
+    found = {
+        leaf
+        for leaf in canonical
+        if (root / leaf).is_dir() and (root / leaf / "data.jsonl").exists()
+    }
+
     errors: list[str] = []
-    found = {p.name for p in root.iterdir() if p.is_dir() and (p / "data.jsonl").exists()} if root.exists() else set()
     if require_all:
-        missing = sorted(set(SEEDS) - found)
+        missing = sorted(canonical - found)
         if missing:
             errors.append("Missing tasks: " + ", ".join(missing))
-    for name in sorted(found):
-        errors.extend(validate_task(root / name, require_assets=require_assets))
+
+    for leaf in sorted(found):
+        errors.extend(validate_task(root / leaf, require_assets=require_assets))
     return errors
 

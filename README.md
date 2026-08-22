@@ -5,7 +5,7 @@ This package builds **exactly 100 deterministic examples for each of 23 leaves**
 
 ## August 2026 Bloom-balanced benchmark overlay
 
-Release `1.3.0` adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
+Release `1.3.1` includes the Bloom-balanced conversion introduced in 1.3.0 and adds robust canonical-leaf validation. It adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
 
 The conversion is intentionally lightweight: it rewrites only `data.jsonl` and `manifest.json`, preserves all original target fields, adds `target.bloom_answer`, and stores the original two metadata files under `.pre_bloom/`. It does not redownload OpenEarthMap, SpaceNet, MapText, or any other upstream source.
 
@@ -41,7 +41,7 @@ Release `1.2.0` includes the original eight `1.1.0` corrections plus five additi
 - SpaceNet 3 graph and route inputs are converted from high-bit-depth TIFFs to contrast-stretched RGB PNGs; graph and route overlays are rendered over the satellite image.
 - Topological/directional reasoning uses clearly filled polygon regions rather than ambiguous point markers.
 
-The validator enforces these properties for the thirteen revised leaves. Their manifests contain `data_revision = "2026-07-comments-v2"`.
+The validator enforces regeneration-specific revision checks for the twelve currently strict revised leaves. The accepted legacy `isochrone_service_area` leaf still receives normal record/count/checksum/asset/Bloom validation, but is exempt from the later isochrone-regeneration diversity assertions. Revised manifests use `data_revision = "2026-07-comments-v2"` where applicable.
 
 The original eight-task Colab remains at [`notebooks/GeoMapBench_fixed_tasks_colab.ipynb`](notebooks/GeoMapBench_fixed_tasks_colab.ipynb). A second notebook, [`notebooks/GeoMapBench_additional_fixes_colab.ipynb`](notebooks/GeoMapBench_additional_fixes_colab.ipynb), rebuilds the three lightweight public-data tasks and upgrades the two existing SpaceNet folders in place without redownloading SpaceNet.
 
@@ -211,6 +211,8 @@ For a release, require all 23 leaves and all referenced assets:
 ```bash
 geomapbench-data validate --root "$OUT" --require-all
 ```
+
+Validation is keyed to the canonical 23 leaf names in `geomapbench_data.common.SEEDS`. Noncanonical sibling directories (for example Google Drive copies ending in ` (1)`) are ignored rather than treated as benchmark leaves. The accepted legacy `isochrone_service_area` release is validated normally but is exempt from the newer regeneration-specific diversity checks.
 
 ## Output record
 
