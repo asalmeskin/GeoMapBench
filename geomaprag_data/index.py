@@ -17,7 +17,7 @@ def _assert_pillow_runtime() -> None:
     except ImportError as error:
         raise RuntimeError(
             "Pillow is inconsistent in this runtime. In Colab run the setup cell that force-reinstalls "
-            "Pillow==11.3.0 before importing sentence_transformers/transformers, then rerun this command."
+            "Pillow==12.3.0 before importing sentence_transformers/transformers, then rerun this command."
         ) from error
 
 
