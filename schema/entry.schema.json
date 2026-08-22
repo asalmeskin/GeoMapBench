@@ -3,27 +3,126 @@
   "$id": "https://geomapbench.example/schema/entry.schema.json",
   "title": "GeoMapBench source example",
   "type": "object",
-  "required": ["id", "leaf", "seed", "group_id", "source", "input", "target", "evaluation"],
+  "required": [
+    "id",
+    "leaf",
+    "seed",
+    "group_id",
+    "source",
+    "input",
+    "target",
+    "evaluation"
+  ],
   "properties": {
-    "id": {"type": "string"},
-    "leaf": {"type": "string"},
-    "seed": {"type": "integer"},
-    "group_id": {"type": "string"},
+    "id": {
+      "type": "string"
+    },
+    "leaf": {
+      "type": "string"
+    },
+    "seed": {
+      "type": "integer"
+    },
+    "group_id": {
+      "type": "string"
+    },
     "source": {
       "type": "object",
-      "required": ["name", "url", "license"],
+      "required": [
+        "name",
+        "url",
+        "license"
+      ],
       "properties": {
-        "name": {"type": "string"},
-        "url": {"type": "string", "format": "uri"},
-        "license": {"type": "string"}
+        "name": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "license": {
+          "type": "string"
+        }
       },
       "additionalProperties": true
     },
-    "input": {"type": "object"},
-    "target": {"type": "object"},
-    "evaluation": {"type": "object"},
-    "attribution": {"type": "object"}
+    "input": {
+      "type": "object"
+    },
+    "target": {
+      "type": "object"
+    },
+    "evaluation": {
+      "type": "object"
+    },
+    "attribution": {
+      "type": "object"
+    },
+    "bloom": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "level": {
+          "type": "string",
+          "enum": [
+            "R",
+            "U",
+            "Ap",
+            "An",
+            "E",
+            "C"
+          ]
+        },
+        "level_name": {
+          "type": "string",
+          "enum": [
+            "Remember",
+            "Understand",
+            "Apply",
+            "Analyze",
+            "Evaluate",
+            "Create"
+          ]
+        },
+        "level_rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "variant": {
+          "type": "string"
+        },
+        "occurrence_within_level": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_record_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "supported_levels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "current_levels_before_expansion": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "base_evaluation": {
+      "type": "object"
+    }
   },
   "additionalProperties": true
 }
-

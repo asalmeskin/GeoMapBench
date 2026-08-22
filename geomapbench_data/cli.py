@@ -12,6 +12,7 @@ from .api_generators import (
     generate_visual_geolocation,
 )
 from .common import SEEDS
+from .bloom import BLOOM_LEVELS, bloom_audit_root, bloomify_root, restore_bloom_root
 from .download import download_zenodo, extract_zip
 from .network_generators import (
     generate_osm_isochrones,
@@ -98,6 +99,20 @@ def make_parser() -> argparse.ArgumentParser:
     val.add_argument("--skip-assets", action="store_true")
 
     sub.add_parser("seeds")
+
+    bloomify = sub.add_parser("bloomify", help="Convert an existing 23-leaf GeoMapBench release into a balanced Bloom variant in place without changing assets.")
+    bloomify.add_argument("--root", type=_path, required=True)
+    bloomify.add_argument("--no-backup", action="store_true", help="Do not save the original data.jsonl/manifest.json under each leaf's .pre_bloom directory.")
+    bloomify.add_argument("--force", action="store_true", help="Rebuild Bloom metadata/questions even if the same Bloom revision is already present.")
+    bloomify.add_argument("--allow-partial", action="store_true", help="Allow conversion of a root that contains fewer than all 23 leaves.")
+
+    bloom_audit = sub.add_parser("bloom-audit", help="Audit Bloom level coverage and per-leaf balance.")
+    bloom_audit.add_argument("--root", type=_path, required=True)
+    bloom_audit.add_argument("--allow-partial", action="store_true")
+
+    restore_bloom = sub.add_parser("bloom-restore", help="Restore pre-Bloom data.jsonl and manifest.json backups.")
+    restore_bloom.add_argument("--root", type=_path, required=True)
+    restore_bloom.add_argument("--allow-partial", action="store_true")
     return parser
 
 
@@ -116,6 +131,24 @@ def main(argv: list[str] | None = None) -> int:
             print("\n".join(errors))
             return 1
         print("Validation passed")
+        return 0
+
+
+    if command == "bloomify":
+        report = bloomify_root(
+            args.root,
+            backup=not args.no_backup,
+            force=args.force,
+            require_all=not args.allow_partial,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report.get("valid") else 1
+    if command == "bloom-audit":
+        report = bloom_audit_root(args.root, require_all=not args.allow_partial)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report.get("valid") else 1
+    if command == "bloom-restore":
+        print(json.dumps(restore_bloom_root(args.root, require_all=not args.allow_partial), indent=2, sort_keys=True))
         return 0
 
     source_dispatch = {

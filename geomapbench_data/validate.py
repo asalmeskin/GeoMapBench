@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .common import DATA_REVISION, N_EXAMPLES, SEEDS, read_jsonl, sha256_file
+from .bloom import BLOOM_LEVELS, BLOOM_REVISION, bloom_distribution
 
 
 REVISED_TASKS = {
@@ -76,6 +77,8 @@ def validate_task(task_dir: Path, require_assets: bool = True) -> list[str]:
                 elif not candidate.exists():
                     errors.append(f"{task_dir.name}:{line_number}: missing asset {asset}")
     errors.extend(_validate_revised_content(task_dir, records))
+    if manifest.get("bloom_revision") is not None:
+        errors.extend(_validate_bloom_content(task_dir, records, manifest))
     return errors
 
 
@@ -231,6 +234,45 @@ def _validate_revised_content(task_dir: Path, records: list[dict[str, Any]]) -> 
                 if mask.mode != "L":
                     errors.append(f"{name}:{index}: mask must be single-channel L mode, found {mask.mode}")
                     break
+    return errors
+
+
+
+def _validate_bloom_content(
+    task_dir: Path,
+    records: list[dict[str, Any]],
+    manifest: dict[str, Any],
+) -> list[str]:
+    name = task_dir.name
+    errors: list[str] = []
+    if name not in BLOOM_LEVELS:
+        return [f"{name}: Bloom metadata present for unknown leaf"]
+    if manifest.get("bloom_revision") != BLOOM_REVISION:
+        errors.append(
+            f"{name}: expected bloom_revision {BLOOM_REVISION}, "
+            f"found {manifest.get('bloom_revision')}"
+        )
+    expected = bloom_distribution(BLOOM_LEVELS[name], len(records))
+    observed: dict[str, int] = {}
+    for index, record in enumerate(records, 1):
+        bloom = record.get("bloom")
+        if not isinstance(bloom, dict):
+            errors.append(f"{name}:{index}: missing bloom metadata")
+            continue
+        level = bloom.get("level")
+        observed[level] = observed.get(level, 0) + 1
+        if level not in BLOOM_LEVELS[name]:
+            errors.append(f"{name}:{index}: unsupported Bloom level {level!r}")
+        if bloom.get("revision") != BLOOM_REVISION:
+            errors.append(f"{name}:{index}: wrong Bloom record revision")
+        if "bloom_answer" not in record.get("target", {}):
+            errors.append(f"{name}:{index}: missing target.bloom_answer")
+        if record.get("evaluation", {}).get("target_field") != "target.bloom_answer":
+            errors.append(f"{name}:{index}: evaluation.target_field must be target.bloom_answer")
+    if observed != expected:
+        errors.append(f"{name}: Bloom distribution {observed} != expected {expected}")
+    if manifest.get("bloom_distribution") != expected:
+        errors.append(f"{name}: manifest Bloom distribution mismatch")
     return errors
 
 

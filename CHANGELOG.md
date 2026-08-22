@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0 — August 2026 Bloom-balanced expansion
+
+- Added deterministic Bloom-level stratification for all 23 leaves using only the existing 100 source records per leaf.
+- Added `geomapbench-data bloomify`, `bloom-audit`, and `bloom-restore`.
+- Five-level leaves are balanced 20/20/20/20/20; six-level leaves are balanced 17/17/17/17/16/16.
+- Bloom conversion reuses all existing assets and preserves all original target fields.
+- Added `target.bloom_answer`, Bloom metadata, base-evaluation preservation, and per-leaf `.pre_bloom` metadata backups.
+- Added `config/bloom_taxonomy.csv`, `BLOOM_EXPANSION.md`, and a Drive-ready Colab conversion notebook.
+- Extended validation to enforce Bloom revision, supported levels, and exact level distributions when Bloom metadata is present.
+
 ## 1.2.0 — July 2026 additional data-quality fixes
 
 Five additional leaves must be refreshed when upgrading from 1.1.0:

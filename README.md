@@ -2,6 +2,28 @@
 
 This package builds **exactly 100 deterministic examples for each of 23 leaves** in the revised GeoMapBench taxonomy. It does not bundle multi-gigabyte upstream imagery or silently relicense it. Instead, it supplies official source links, download helpers, fixed per-leaf seeds, source-specific samplers, public-API generators, cached raw responses, provenance, and validation.
 
+
+## August 2026 Bloom-balanced benchmark overlay
+
+Release `1.3.0` adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
+
+The conversion is intentionally lightweight: it rewrites only `data.jsonl` and `manifest.json`, preserves all original target fields, adds `target.bloom_answer`, and stores the original two metadata files under `.pre_bloom/`. It does not redownload OpenEarthMap, SpaceNet, MapText, or any other upstream source.
+
+```bash
+geomapbench-data validate --root "$OUT" --require-all
+geomapbench-data bloomify --root "$OUT"
+geomapbench-data validate --root "$OUT" --require-all
+geomapbench-data bloom-audit --root "$OUT"
+```
+
+Restore the pre-Bloom metadata if needed:
+
+```bash
+geomapbench-data bloom-restore --root "$OUT"
+```
+
+See [`BLOOM_EXPANSION.md`](BLOOM_EXPANSION.md) and [`config/bloom_taxonomy.csv`](config/bloom_taxonomy.csv) for the exact per-leaf levels, prompts, targets, and balancing policy. The ready-to-run Colab is [`notebooks/GeoMapBench_Bloom_Update_Colab.ipynb`](notebooks/GeoMapBench_Bloom_Update_Colab.ipynb).
+
 ## July 2026 quality revisions
 
 Release `1.2.0` includes the original eight `1.1.0` corrections plus five additional benchmark-quality fixes:
