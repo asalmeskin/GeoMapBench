@@ -182,3 +182,23 @@ def test_embedding_batch_key_is_content_sensitive() -> None:
     first = _batch_key("model", ["id:content_hash_a"])
     second = _batch_key("model", ["id:content_hash_b"])
     assert first != second
+
+
+def test_epsg_info_deduplication_is_deterministic():
+    from types import SimpleNamespace
+    from geomaprag_data.epsg import _dedupe_epsg_infos
+
+    infos = [
+        SimpleNamespace(auth_name="EPSG", code="3021"),
+        SimpleNamespace(auth_name="EPSG", code="2393"),
+        SimpleNamespace(auth_name="EPSG", code="3021"),
+        SimpleNamespace(auth_name="EPSG", code="3106"),
+        SimpleNamespace(auth_name="epsg", code="2393"),
+    ]
+
+    result = _dedupe_epsg_infos(infos)
+    assert [(str(x.auth_name).upper(), str(x.code)) for x in result] == [
+        ("EPSG", "2393"),
+        ("EPSG", "3021"),
+        ("EPSG", "3106"),
+    ]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 from pyproj import CRS
 from pyproj.database import query_crs_info
@@ -11,19 +11,48 @@ from .common import CorpusWorkspace, make_record
 from .config import BuildProfile, CAPABILITY_HINTS
 
 
+def _dedupe_epsg_infos(infos: Iterable[Any]) -> list[Any]:
+    """Return one CRSInfo per authority/code pair in deterministic order.
+
+    Some PROJ/pyproj database builds can expose the same EPSG authority/code
+    more than once. Corpus IDs are keyed by EPSG code, so those duplicates
+    must be removed before slicing the requested profile size.
+    """
+
+    unique: dict[tuple[str, str], Any] = {}
+    for info in infos:
+        key = (str(info.auth_name).upper(), str(info.code))
+        unique.setdefault(key, info)
+
+    return sorted(
+        unique.values(),
+        key=lambda info: (int(info.code), str(info.auth_name).upper()),
+    )
+
+
 def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: BenchmarkGuard) -> dict[str, Any]:
     unit = f"epsg_{profile.epsg_max_records}"
     if workspace.shard_done("epsg", unit):
         return {"stage": "epsg", "written": 0, "cached_units": 1, "failed_units": []}
 
-    infos = sorted(query_crs_info(auth_name="EPSG"), key=lambda info: int(info.code))[: profile.epsg_max_records]
-    existing = workspace.existing_ids()
+    # IMPORTANT: deduplicate *before* applying the profile limit so that an
+    # iclr profile asking for 6000 CRS candidates really gets up to 6000
+    # distinct EPSG authority/code pairs.
+    infos = _dedupe_epsg_infos(query_crs_info(auth_name="EPSG"))[: profile.epsg_max_records]
+
+    # Includes legacy v1 records and already completed incremental shards.
+    seen_ids = workspace.existing_ids()
     records: list[dict[str, Any]] = []
+
     bar = tqdm(infos, desc="EPSG / PROJ", unit="CRS", dynamic_ncols=True)
     for info in bar:
         record_id = f"epsg:{info.code}"
-        if record_id in existing:
+
+        # This protects both against legacy overlap and against any future
+        # duplicate CRSInfo rows that slip through upstream database changes.
+        if record_id in seen_ids:
             continue
+
         try:
             crs = CRS.from_authority(info.auth_name, info.code)
             axes = [
@@ -48,6 +77,7 @@ def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: Benchma
             )
             if area:
                 text += f" Area of use: {area.name}."
+
             records.append(
                 make_record(
                     record_id=record_id,
@@ -81,8 +111,22 @@ def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: Benchma
                     },
                 )
             )
+
+            # Mark it immediately so one build invocation can never emit the
+            # same corpus ID twice, regardless of upstream CRSInfo behavior.
+            seen_ids.add(record_id)
+
         except Exception as error:
             print(f"EPSG warning {info.code}: {error!r}")
 
-    workspace.write_shard("epsg", unit, records, meta={"status": "complete", "requested": len(infos)})
+    workspace.write_shard(
+        "epsg",
+        unit,
+        records,
+        meta={
+            "status": "complete",
+            "requested": len(infos),
+            "unique_candidates": len(infos),
+        },
+    )
     return {"stage": "epsg", "written": len(records), "cached_units": 0, "failed_units": []}
