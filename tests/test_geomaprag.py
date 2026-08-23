@@ -202,3 +202,118 @@ def test_epsg_info_deduplication_is_deterministic():
         ("EPSG", "3021"),
         ("EPSG", "3106"),
     ]
+
+
+
+def test_materialize_is_byte_deterministic_for_legacy_records(tmp_path: Path) -> None:
+    """Legacy normalization must not inject a fresh timestamp on every materialize."""
+    from geomaprag_data.common import sha256_file
+
+    root = tmp_path / "GeoMapRAG_Corpus"
+    root.mkdir()
+    legacy = {
+        "doc_id": "legacy:deterministic",
+        "modality": "text",
+        "source": "Wikipedia",
+        "title": "Legacy deterministic record",
+        "text": "A sufficiently long legacy geographic passage whose materialized bytes must remain stable.",
+        "source_id": "legacy-source-id",
+    }
+    (root / "corpus.jsonl").write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    workspace = CorpusWorkspace(root)
+    workspace.materialize()
+    first_hash = sha256_file(root / "corpus.jsonl")
+    first_row = read_jsonl(root / "corpus.jsonl")[0]
+
+    workspace.materialize()
+    second_hash = sha256_file(root / "corpus.jsonl")
+    second_row = read_jsonl(root / "corpus.jsonl")[0]
+
+    assert first_hash == second_hash
+    assert first_row == second_row
+    assert first_row["provenance"]["retrieved_at"] == "legacy-v1-unknown"
+
+
+def test_wikidata_deduplicates_duplicate_qlever_bindings(tmp_path: Path, monkeypatch) -> None:
+    """Multi-valued OPTIONAL fields must not create duplicate IDs in one family shard."""
+    import geomaprag_data.wikidata as wikidata
+    from geomaprag_data.benchmark_guard import BenchmarkGuard
+    from geomaprag_data.config import BuildProfile
+
+    # Limit the test to one family so it is completely offline and small.
+    monkeypatch.setattr(
+        wikidata,
+        "WIKIDATA_FAMILIES",
+        {"mountains": ("Q8502", "mountain")},
+    )
+
+    duplicate_payload = {
+        "results": {
+            "bindings": [
+                {
+                    "item": {"value": "http://www.wikidata.org/entity/Q123"},
+                    "itemLabel": {"value": "Example Peak"},
+                    "countryLabel": {"value": "Country B"},
+                    "coord": {"value": "Point(8.0 47.0)"},
+                    "elevation": {"value": "1000"},
+                },
+                {
+                    "item": {"value": "http://www.wikidata.org/entity/Q123"},
+                    "itemLabel": {"value": "Example Peak"},
+                    "countryLabel": {"value": "Country A"},
+                    "coord": {"value": "Point(8.0 47.0)"},
+                    "elevation": {"value": "1000"},
+                },
+                {
+                    "item": {"value": "http://www.wikidata.org/entity/Q124"},
+                    "itemLabel": {"value": "Other Peak"},
+                    "countryLabel": {"value": "Country C"},
+                    "coord": {"value": "Point(9.0 46.0)"},
+                },
+            ]
+        }
+    }
+
+    class FakeHTTP:
+        def __init__(self, cache_dir):
+            self.cache_dir = cache_dir
+
+        def get_json(self, *args, **kwargs):
+            return duplicate_payload
+
+    monkeypatch.setattr(wikidata, "CachedHTTP", FakeHTTP)
+
+    profile = BuildProfile(
+        name="test",
+        wikipedia_seed_count=1,
+        wikipedia_pages_per_seed=1,
+        wikipedia_target_chunks=1,
+        wikidata_per_family=10,
+        epsg_max_records=1,
+        geonames_max_records=1,
+        worldbank_years=(2024,),
+        wikimedia_seed_count=1,
+        wikimedia_images_per_seed=1,
+        osm_seed_count=1,
+        osm_radius_m=100,
+        osm_docs_per_region=1,
+        osm_maps_per_region=1,
+        osm_map_radius_m=100,
+        osm_tile_offset_m=50,
+    )
+
+    workspace = CorpusWorkspace(tmp_path / "rag")
+    report = wikidata.build_wikidata(
+        workspace,
+        profile,
+        BenchmarkGuard(),
+        checkpoint_every=0,
+    )
+
+    rows = read_jsonl(workspace.shard_path("wikidata", "mountains_10"))
+    assert report["failed_units"] == []
+    assert report["written"] == 2
+    assert [row["id"] for row in rows] == ["wikidata:Q123", "wikidata:Q124"]
+    # Deterministic sorting retains the lexicographically first full binding.
+    assert rows[0]["extra"]["country"] == "Country A"

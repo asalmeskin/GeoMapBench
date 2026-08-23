@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -88,14 +89,27 @@ def build_wikidata(
                 extra_headers={"Accept": "application/sparql-results+json"},
             )
             bindings = payload.get("results", {}).get("bindings", [])
+            # QLever can return several bindings for one QID when OPTIONAL
+            # fields such as country or elevation are multi-valued. Sort first
+            # so the retained binding is deterministic, then deduplicate inside
+            # this atomic family shard.
+            bindings = sorted(
+                bindings,
+                key=lambda binding: json.dumps(
+                    binding,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ),
+            )
             records: list[dict[str, Any]] = []
+            unit_ids: set[str] = set()
             for binding in bindings:
                 uri = (binding.get("item") or {}).get("value")
                 if not uri:
                     continue
                 item_qid = str(uri).rsplit("/", 1)[-1]
                 record_id = f"wikidata:{item_qid}"
-                if record_id in existing or item_qid in guard.qids:
+                if record_id in existing or record_id in unit_ids or item_qid in guard.qids:
                     continue
                 title = str((binding.get("itemLabel") or {}).get("value") or item_qid)
                 country = (binding.get("countryLabel") or {}).get("value")
@@ -114,6 +128,7 @@ def build_wikidata(
                 if guard.reject_text(text):
                     continue
                 geo = None if lat is None or lon is None else {"lat": lat, "lon": lon}
+                unit_ids.add(record_id)
                 records.append(
                     make_record(
                         record_id=record_id,

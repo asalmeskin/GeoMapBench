@@ -224,6 +224,15 @@ def normalize_legacy_record(row: dict[str, Any]) -> dict[str, Any]:
         capabilities=capabilities,
         document_type="legacy_v1_reference",
         generator="legacy_notebook_v1",
+        # Legacy v1 records did not consistently store a retrieval timestamp.
+        # Never synthesize utc_now() while materializing a legacy snapshot:
+        # doing so would change corpus.jsonl (and its SHA-256) on every run.
+        retrieved_at=str(
+            row.get("retrieved_at")
+            or row.get("created_at")
+            or row.get("timestamp")
+            or "legacy-v1-unknown"
+        ),
         extra=extra,
     )
 
