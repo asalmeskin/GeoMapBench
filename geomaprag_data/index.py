@@ -16,8 +16,9 @@ def _assert_pillow_runtime() -> None:
         from PIL import Image, ImageText  # noqa: F401
     except ImportError as error:
         raise RuntimeError(
-            "Pillow is inconsistent in this runtime. In Colab run the setup cell that force-reinstalls "
-            "Pillow==12.3.0 before importing sentence_transformers/transformers, then rerun this command."
+            "Pillow is inconsistent in this runtime. In Colab use the numbered notebook environment cell; "
+            "if it reports that Pillow was repaired or PIL was already loaded, restart the session once, "
+            "then rerun Cells 1→4 before indexing."
         ) from error
 
 
