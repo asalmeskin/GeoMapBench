@@ -245,17 +245,13 @@ Do not randomly split individual questions after generating Bloom variants. Spli
 
 ---
 
-## Large GeoMapRAG retrieval corpus (v1.4.0)
+## Large GeoMapRAG retrieval corpus
 
-This repository now also contains `geomaprag_data/`, a large, resume-safe retrieval-corpus builder designed to complement GeoMapBench evaluation. The full design and commands are documented in [`GEOMAPRAG_DATA.md`](GEOMAPRAG_DATA.md), and the ready-to-run Colab is [`notebooks/GeoMapRAG_Corpus_Colab.ipynb`](notebooks/GeoMapRAG_Corpus_Colab.ipynb).
+This repository also contains `geomaprag_data/`, a large, resume-safe retrieval-corpus builder designed to complement GeoMapBench evaluation. The full design is documented in [`GEOMAPRAG_DATA.md`](GEOMAPRAG_DATA.md), and the numbered Colab runner is [`notebooks/GeoMapRAG_Corpus_NUMBERED.ipynb`](notebooks/GeoMapRAG_Corpus_NUMBERED.ipynb).
 
-The `iclr` profile expands the original 6,649-record prototype using Wikipedia, Wikidata/QLever, GeoNames, World Bank, EPSG/PROJ, and OpenStreetMap. It targets a healthy corpus in the tens of thousands of records with hundreds to roughly one thousand unlabeled metric map crops. Each network unit is committed as an atomic shard, so interrupted Colab runs can resume without discarding completed work. A benchmark-overlap guard filters exact text/source identifiers and nearby coordinates before RAG records are admitted.
+The `iclr` profile builds a fresh corpus from Wikipedia, Wikidata/QLever, GeoNames, World Bank, EPSG/PROJ, Wikimedia Commons, and OpenStreetMap. Existing materialized corpus files are never imported as source records. Every completed network/source unit is committed as an atomic shard, so interrupted Colab runs resume without discarding completed work. A benchmark-overlap guard filters exact text/source identifiers and nearby coordinates before RAG records are admitted.
 
 ```bash
-geomaprag-data migrate \
-  --old-root /content/drive/MyDrive/GeoMapRAG_Corpus_v1 \
-  --new-root /content/drive/MyDrive/GeoMapRAG_Corpus
-
 geomaprag-data build \
   --output /content/drive/MyDrive/GeoMapRAG_Corpus \
   --benchmark-root /content/drive/MyDrive/GeoMapBench_Data/geomapbench_100 \
@@ -263,14 +259,15 @@ geomaprag-data build \
 
 geomaprag-data validate \
   --root /content/drive/MyDrive/GeoMapRAG_Corpus \
-  --profile iclr
+  --profile iclr \
+  --strict-scale
 
 geomaprag-data clean \
   --root /content/drive/MyDrive/GeoMapRAG_Corpus \
   --overwrite
 ```
 
-The benchmark cleaner was moved into `geomapbench_data/clean_data.py` and is now available through the package CLI:
+The benchmark cleaner lives in `geomapbench_data/clean_data.py` and is available through:
 
 ```bash
 geomapbench-data clean --root /path/to/geomapbench_100 --overwrite

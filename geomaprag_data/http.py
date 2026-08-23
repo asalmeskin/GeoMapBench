@@ -11,7 +11,7 @@ import requests
 from .common import atomic_write_json, sha256_file, slugify
 
 
-USER_AGENT = "GeoMapRAGDataKit/2.0 (https://github.com/asalmeskin/GeoMapBench; academic geospatial retrieval corpus construction)"
+USER_AGENT = "GeoMapRAGDataKit (https://github.com/asalmeskin/GeoMapBench; academic geospatial retrieval corpus construction)"
 
 
 class CachedHTTP:

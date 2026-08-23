@@ -34,26 +34,35 @@ def _geosearch(http: CachedHTTP, city: str, lat: float, lon: float, limit: int) 
     return payload.get("query", {}).get("geosearch", [])
 
 
-def _pages(http: CachedHTTP, city: str, page_ids: list[int]) -> list[dict[str, Any]]:
-    if not page_ids:
-        return []
-    payload = http.get_json(
-        WIKIPEDIA_API,
-        {
-            "action": "query",
-            "format": "json",
-            "formatversion": 2,
-            "prop": "extracts|coordinates|info|pageprops",
-            "explaintext": 1,
-            "inprop": "url",
-            "pageids": "|".join(str(x) for x in page_ids),
-            "maxlag": 5,
-        },
-        f"wikipedia/pages/{slugify(city)}",
-        timeout=150,
-        max_attempts=12,
-    )
-    return payload.get("query", {}).get("pages", [])
+def _pages(http: CachedHTTP, city: str, page_ids: list[int], batch_size: int = 50) -> list[dict[str, Any]]:
+    """Fetch page extracts in deterministic API-safe batches.
+
+    MediaWiki limits the number of page IDs accepted by a normal client in one
+    request. Batching lets the ICLR profile retrieve substantially broader
+    geographic context without relying on privileged API limits.
+    """
+    unique_ids = sorted(set(int(page_id) for page_id in page_ids))
+    pages: list[dict[str, Any]] = []
+    for batch_index, start in enumerate(range(0, len(unique_ids), batch_size), 1):
+        batch = unique_ids[start : start + batch_size]
+        payload = http.get_json(
+            WIKIPEDIA_API,
+            {
+                "action": "query",
+                "format": "json",
+                "formatversion": 2,
+                "prop": "extracts|coordinates|info|pageprops",
+                "explaintext": 1,
+                "inprop": "url",
+                "pageids": "|".join(str(x) for x in batch),
+                "maxlag": 5,
+            },
+            f"wikipedia/pages/{slugify(city)}/batch-{batch_index:02d}",
+            timeout=150,
+            max_attempts=12,
+        )
+        pages.extend(payload.get("query", {}).get("pages", []))
+    return pages
 
 
 def build_wikipedia(
@@ -117,7 +126,7 @@ def build_wikipedia(
                 page_lon = coordinates.get("lon", lon)
                 if guard.near(page_lat, page_lon):
                     continue
-                for chunk_index, chunk in enumerate(chunk_text(extract)):
+                for chunk_index, chunk in enumerate(chunk_text(extract, target_words=300, overlap_words=45)):
                     if guard.reject_text(chunk):
                         continue
                     record_id = f"wikipedia:{page_id}:{chunk_index}"

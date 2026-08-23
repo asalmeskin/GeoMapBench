@@ -76,7 +76,7 @@ def _country_names(path: Path) -> dict[str, str]:
 
 
 def _stable_score(geoname_id: str) -> int:
-    return int(hashlib.sha256(f"geomaprag-geonames-v2:{geoname_id}".encode("utf-8")).hexdigest(), 16)
+    return int(hashlib.sha256(f"geomaprag-geonames:{geoname_id}".encode("utf-8")).hexdigest(), 16)
 
 
 def _push_smallest(
@@ -203,7 +203,7 @@ def _country_candidate_cache(
     return (
         workspace.cache_dir
         / "geonames"
-        / "candidate_shards_v3"
+        / "candidate_shards"
         / f"{country}_pool{pool_limit}_{_guard_fingerprint(guard)}.jsonl"
     )
 

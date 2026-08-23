@@ -7,7 +7,6 @@ from PIL import Image
 
 from geomaprag_data.clean_data import clean_corpus
 from geomaprag_data.common import CorpusWorkspace, make_record, read_jsonl
-from geomaprag_data.migrate import migrate_legacy_root
 from geomaprag_data.osm import _tile_offsets, render_map_tile
 
 
@@ -27,18 +26,16 @@ def _record(record_id: str, text: str) -> dict:
     )
 
 
-def test_workspace_preserves_legacy_and_resumes_shards(tmp_path: Path) -> None:
+def test_workspace_materializes_only_completed_shards_and_resumes(tmp_path: Path) -> None:
     root = tmp_path / "GeoMapRAG_Corpus"
     root.mkdir()
-    legacy = {
-        "doc_id": "legacy:1",
-        "modality": "text",
-        "source": "Wikipedia",
-        "title": "Legacy",
-        "text": "A sufficiently long legacy geographic reference passage for testing purposes.",
-        "source_id": "1",
-    }
-    (root / "corpus.jsonl").write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    # A stale materialized corpus must never be imported back into build state.
+    stale = _record(
+        "stale:1",
+        "A stale materialized record that must not become a source shard during a fresh build.",
+    )
+    (root / "corpus.jsonl").write_text(json.dumps(stale) + "\n", encoding="utf-8")
 
     workspace = CorpusWorkspace(root)
     workspace.write_shard(
@@ -48,14 +45,14 @@ def test_workspace_preserves_legacy_and_resumes_shards(tmp_path: Path) -> None:
     )
     assert workspace.shard_done("wikipedia", "unit_a")
     manifest = workspace.materialize()
-    assert manifest["count"] == 2
+    assert manifest["count"] == 1
     rows = read_jsonl(root / "corpus.jsonl")
-    assert {row["id"] for row in rows} == {"legacy:1", "new:1"}
+    assert {row["id"] for row in rows} == {"new:1"}
 
     # A second process sees the same shard and does not need to recreate it.
     workspace2 = CorpusWorkspace(root)
     assert workspace2.shard_done("wikipedia", "unit_a")
-    assert workspace2.materialize()["count"] == 2
+    assert workspace2.materialize()["count"] == 1
 
 
 def test_clean_corpus_keeps_model_fields_and_moves_provenance(tmp_path: Path) -> None:
@@ -75,17 +72,6 @@ def test_clean_corpus_keeps_model_fields_and_moves_provenance(tmp_path: Path) ->
     provenance = read_jsonl(root / "_clean_metadata" / "provenance.jsonl")[0]
     assert provenance["id"] == "r:1"
     assert "provenance" in provenance
-
-
-def test_migrate_old_root_without_overwrite(tmp_path: Path) -> None:
-    old = tmp_path / "GeoMapRAG_Corpus_v1"
-    new = tmp_path / "GeoMapRAG_Corpus"
-    old.mkdir()
-    (old / "corpus.jsonl").write_text('{"doc_id":"x","text":"legacy text"}\n', encoding="utf-8")
-    report = migrate_legacy_root(old, new)
-    assert report["action"] == "moved_old_root_to_new_root"
-    assert not old.exists()
-    assert (new / "corpus.jsonl").exists()
 
 
 def test_tile_offsets_are_deterministic() -> None:
@@ -205,23 +191,20 @@ def test_epsg_info_deduplication_is_deterministic():
 
 
 
-def test_materialize_is_byte_deterministic_for_legacy_records(tmp_path: Path) -> None:
-    """Legacy normalization must not inject a fresh timestamp on every materialize."""
+def test_materialize_is_byte_deterministic_for_completed_shards(tmp_path: Path) -> None:
     from geomaprag_data.common import sha256_file
 
     root = tmp_path / "GeoMapRAG_Corpus"
-    root.mkdir()
-    legacy = {
-        "doc_id": "legacy:deterministic",
-        "modality": "text",
-        "source": "Wikipedia",
-        "title": "Legacy deterministic record",
-        "text": "A sufficiently long legacy geographic passage whose materialized bytes must remain stable.",
-        "source_id": "legacy-source-id",
-    }
-    (root / "corpus.jsonl").write_text(json.dumps(legacy) + "\n", encoding="utf-8")
-
     workspace = CorpusWorkspace(root)
+    workspace.write_shard(
+        "wikipedia",
+        "deterministic",
+        [_record(
+            "deterministic:1",
+            "A sufficiently long geographic passage whose materialized bytes must remain stable across rebuilds.",
+        )],
+    )
+
     workspace.materialize()
     first_hash = sha256_file(root / "corpus.jsonl")
     first_row = read_jsonl(root / "corpus.jsonl")[0]
@@ -232,7 +215,6 @@ def test_materialize_is_byte_deterministic_for_legacy_records(tmp_path: Path) ->
 
     assert first_hash == second_hash
     assert first_row == second_row
-    assert first_row["provenance"]["retrieved_at"] == "legacy-v1-unknown"
 
 
 def test_wikidata_deduplicates_duplicate_qlever_bindings(tmp_path: Path, monkeypatch) -> None:

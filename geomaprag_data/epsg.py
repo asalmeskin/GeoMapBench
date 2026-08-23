@@ -40,7 +40,7 @@ def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: Benchma
     # distinct EPSG authority/code pairs.
     infos = _dedupe_epsg_infos(query_crs_info(auth_name="EPSG"))[: profile.epsg_max_records]
 
-    # Includes legacy v1 records and already completed incremental shards.
+    # Includes IDs from already completed source shards.
     seen_ids = workspace.existing_ids()
     records: list[dict[str, Any]] = []
 
@@ -48,7 +48,7 @@ def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: Benchma
     for info in bar:
         record_id = f"epsg:{info.code}"
 
-        # This protects both against legacy overlap and against any future
+        # This protects against overlap across completed source shards and future
         # duplicate CRSInfo rows that slip through upstream database changes.
         if record_id in seen_ids:
             continue

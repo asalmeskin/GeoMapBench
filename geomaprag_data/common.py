@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import tempfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-CORPUS_REVISION = "2026-08-geomaprag-iclr-v2"
+CORPUS_REVISION = "2026-08-23-geomaprag-iclr"
 DATASET_NAME = "GeoMapRAG"
 
 
@@ -191,59 +190,15 @@ def make_record(
     return record
 
 
-def normalize_legacy_record(row: dict[str, Any]) -> dict[str, Any]:
-    """Convert the v1 notebook schema into the richer v2 corpus schema."""
-    if "id" in row and isinstance(row.get("source"), dict) and isinstance(row.get("input"), dict):
-        return row
-
-    doc_id = str(row.get("doc_id") or row.get("id") or "")
-    if not doc_id:
-        raise ValueError("Legacy GeoMapRAG record lacks doc_id/id")
-    source_name = row.get("source")
-    if isinstance(source_name, dict):
-        source_name = source_name.get("name") or "Unknown"
-    source_name = str(source_name or "Unknown")
-    media = row.get("media_path")
-    media_paths = [str(media)] if media else None
-    capabilities = row.get("capabilities") or []
-    extra = copy.deepcopy(row.get("extra") or {})
-    extra["legacy_record"] = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"text", "title"}}
-
-    return make_record(
-        record_id=doc_id,
-        source_name=source_name,
-        source_url=str(row.get("uri") or ""),
-        license_name=str(row.get("license") or "unspecified; see upstream source"),
-        group_id=str(row.get("source_id") or doc_id),
-        modality=str(row.get("modality") or "text"),
-        title=str(row.get("title") or doc_id),
-        text=str(row.get("text") or ""),
-        source_id=None if row.get("source_id") is None else str(row.get("source_id")),
-        geo=copy.deepcopy(row.get("geo")) if isinstance(row.get("geo"), dict) else None,
-        media_paths=media_paths,
-        capabilities=capabilities,
-        document_type="legacy_v1_reference",
-        generator="legacy_notebook_v1",
-        # Legacy v1 records did not consistently store a retrieval timestamp.
-        # Never synthesize utc_now() while materializing a legacy snapshot:
-        # doing so would change corpus.jsonl (and its SHA-256) on every run.
-        retrieved_at=str(
-            row.get("retrieved_at")
-            or row.get("created_at")
-            or row.get("timestamp")
-            or "legacy-v1-unknown"
-        ),
-        extra=extra,
-    )
-
 
 class CorpusWorkspace:
     """Resume-safe GeoMapRAG workspace.
 
-    The canonical incremental state is a set of atomic source/unit shards plus
-    immutable legacy bootstrap files. ``corpus.jsonl`` is a materialized view.
-    If a run dies after a shard is written, rerunning skips that shard and
-    continues at the next unfinished unit.
+    The canonical incremental state is a set of atomic source/unit shards.
+    ``corpus.jsonl`` is a deterministic materialized view of completed shards.
+    If a run stops after a shard is written, rerunning skips that shard and
+    continues at the next unfinished unit. Existing materialized corpora are
+    never imported back into the build state.
     """
 
     def __init__(self, root: Path):
@@ -251,36 +206,21 @@ class CorpusWorkspace:
         self.root.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.root / "_cache"
         self.shard_dir = self.root / "_shards"
-        self.legacy_dir = self.root / "_legacy"
         self.state_dir = self.root / "_state"
         self.maps_dir = self.root / "maps"
-        for path in (self.cache_dir, self.shard_dir, self.legacy_dir, self.state_dir, self.maps_dir):
+        self.images_dir = self.root / "images"
+        for path in (
+            self.cache_dir,
+            self.shard_dir,
+            self.state_dir,
+            self.maps_dir,
+            self.images_dir,
+        ):
             path.mkdir(parents=True, exist_ok=True)
-        self._bootstrap_current_corpus_once()
 
     @property
     def corpus_path(self) -> Path:
         return self.root / "corpus.jsonl"
-
-    def _bootstrap_current_corpus_once(self) -> None:
-        marker = self.state_dir / "bootstrap_complete.json"
-        if marker.exists():
-            return
-        imported: list[str] = []
-        if self.corpus_path.exists() and self.corpus_path.stat().st_size:
-            digest = sha256_file(self.corpus_path)
-            destination = self.legacy_dir / f"bootstrap_{digest[:12]}.jsonl"
-            if not destination.exists():
-                shutil.copy2(self.corpus_path, destination)
-            imported.append(destination.name)
-        atomic_write_json(
-            marker,
-            {
-                "created_at": utc_now(),
-                "imported": imported,
-                "note": "Existing corpus snapshot captured before incremental v2 shards were added.",
-            },
-        )
 
     def shard_path(self, source: str, unit: str) -> Path:
         return self.shard_dir / slugify(source) / f"{slugify(unit)}.jsonl"
@@ -320,8 +260,6 @@ class CorpusWorkspace:
         return path
 
     def iter_input_files(self) -> Iterator[Path]:
-        for path in sorted(self.legacy_dir.glob("*.jsonl")):
-            yield path
         for path in sorted(self.shard_dir.glob("*/*.jsonl")):
             yield path
 
@@ -333,7 +271,7 @@ class CorpusWorkspace:
         duplicate_text = 0
         for path in self.iter_input_files():
             for raw in read_jsonl(path, tolerate_trailing_partial=True):
-                record = normalize_legacy_record(raw)
+                record = raw
                 record_id = str(record["id"])
                 text = str(record.get("input", {}).get("text", ""))
                 digest = text_hash(text)
@@ -365,7 +303,6 @@ class CorpusWorkspace:
                 "duplicate_texts_skipped": duplicate_text,
             },
             "incremental_state": {
-                "legacy_files": len(list(self.legacy_dir.glob("*.jsonl"))),
                 "completed_shards": len(list(self.shard_dir.glob("*/*.jsonl"))),
             },
         }
@@ -376,10 +313,9 @@ class CorpusWorkspace:
         ids: set[str] = set()
         for path in self.iter_input_files():
             for row in read_jsonl(path, tolerate_trailing_partial=True):
-                try:
-                    ids.add(str(normalize_legacy_record(row)["id"]))
-                except Exception:
-                    continue
+                record_id = row.get("id")
+                if record_id:
+                    ids.add(str(record_id))
         return ids
 
     def status(self) -> dict[str, Any]:
@@ -388,6 +324,5 @@ class CorpusWorkspace:
             "root": str(self.root),
             "corpus_exists": self.corpus_path.exists(),
             "corpus_sha256": sha256_file(self.corpus_path) if self.corpus_path.exists() else None,
-            "legacy_files": [p.name for p in sorted(self.legacy_dir.glob("*.jsonl"))],
             "completed_shards": dict(sorted(source_shards.items())),
         }

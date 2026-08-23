@@ -10,7 +10,6 @@ from .common import CorpusWorkspace
 from .config import PROFILES
 from .index import build_image_index, build_text_index
 from .freeze import freeze_release
-from .migrate import migrate_legacy_root
 from .validate import validate_corpus
 
 
@@ -35,11 +34,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--spatial-exclusion-km", type=float, default=2.0)
 
-    migrate = sub.add_parser("migrate", help="Migrate GeoMapRAG_Corpus_v1 into GeoMapRAG_Corpus non-destructively.")
-    migrate.add_argument("--old-root", type=_path, required=True)
-    migrate.add_argument("--new-root", type=_path, required=True)
-
-    materialize = sub.add_parser("materialize", help="Rebuild corpus.jsonl from legacy snapshots and completed shards.")
+    materialize = sub.add_parser("materialize", help="Rebuild corpus.jsonl deterministically from completed shards.")
     materialize.add_argument("--root", type=_path, required=True)
 
     clean = sub.add_parser("clean", help="Create corpus_clean.jsonl and provenance sidecar.")
@@ -73,9 +68,6 @@ def make_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = make_parser().parse_args(argv)
-    if args.command == "migrate":
-        print(json.dumps(migrate_legacy_root(args.old_root, args.new_root), indent=2, sort_keys=True))
-        return 0
     if args.command == "build":
         stages = {x.strip() for x in args.stages.split(",") if x.strip()} or None
         report = build_all(

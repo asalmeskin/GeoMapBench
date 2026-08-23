@@ -20,7 +20,7 @@ def _code_snapshot(code_root: Path | None) -> dict[str, Any] | None:
         Path("requirements.txt"),
         Path("config/geomaprag_sources.csv"),
         Path("schema/geomaprag_entry.schema.json"),
-        Path("notebooks/GeoMapRAG_Corpus_Colab.ipynb"),
+        Path("notebooks/GeoMapRAG_Corpus_NUMBERED.ipynb"),
     ):
         path = root / relative
         if path.is_file():
@@ -61,7 +61,7 @@ def freeze_release(root: Path, *, code_root: Path | None = None) -> dict[str, An
     if not (root / "corpus.jsonl").exists():
         raise FileNotFoundError(f"Missing corpus.jsonl under {root}")
 
-    include_roots = ["_cache", "_shards", "maps", "images", "indexes", "_clean_metadata", "_state", "_legacy"]
+    include_roots = ["_cache", "_shards", "maps", "images", "indexes", "_clean_metadata", "_state"]
     top_files = ["corpus.jsonl", "corpus_clean.jsonl", "manifest.json", "quality_report.json"]
     files: list[Path] = []
     for name in top_files:

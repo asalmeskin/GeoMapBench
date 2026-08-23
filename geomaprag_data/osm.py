@@ -36,7 +36,7 @@ def _query(lat: float, lon: float, radius_m: int) -> str:
     bbox = f"{south},{west},{north},{east}"
     # One medium-size regional query can generate several local map crops. POIs
     # are node-only to avoid the expensive broad nwr(... out geom) pattern that
-    # caused the v1 notebook to time out repeatedly.
+    # keeps Overpass requests bounded and restart-friendly.
     return f"""
 [out:json][timeout:90][maxsize:268435456];
 (
@@ -388,7 +388,7 @@ def build_osm(
             payload = http.post_json_rotating(
                 OVERPASS_ENDPOINTS,
                 {"data": query},
-                f"overpass/v2/{country}/{city}/{profile.osm_radius_m}",
+                f"overpass/{country}/{city}/{profile.osm_radius_m}",
                 timeout=140,
                 attempts_per_endpoint=2,
             )
@@ -403,7 +403,7 @@ def build_osm(
             )
 
             tile_records: list[dict[str, Any]] = []
-            region_dir = workspace.maps_dir / "osm_v2" / f"{index:03d}_{country}_{slugify(city)}"
+            region_dir = workspace.maps_dir / "osm" / f"{index:03d}_{country}_{slugify(city)}"
             for tile_name, dx, dy in _tile_offsets(profile.osm_maps_per_region, profile.osm_tile_offset_m):
                 destination = region_dir / f"{tile_name}.png"
                 rendered, tile_geo = render_map_tile(
@@ -420,7 +420,7 @@ def build_osm(
                 if guard.near(tile_geo["lat"], tile_geo["lon"]):
                     destination.unlink(missing_ok=True)
                     continue
-                record_id = f"osm-map-v2:{country}:{slugify(city)}:{tile_name}"
+                record_id = f"osm-map:{country}:{slugify(city)}:{tile_name}"
                 if record_id in existing:
                     continue
                 relative = destination.relative_to(workspace.root).as_posix()
