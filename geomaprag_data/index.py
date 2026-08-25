@@ -12,13 +12,17 @@ from .common import atomic_write_json, atomic_write_jsonl, read_jsonl, sha256_fi
 
 
 def _assert_pillow_runtime() -> None:
+    """Verify that Pillow and its compiled imaging extension are usable."""
     try:
-        from PIL import Image, ImageText  # noqa: F401
-    except ImportError as error:
+        from PIL import Image
+
+        probe = Image.new("RGB", (1, 1))
+        probe.close()
+
+    except Exception as error:
         raise RuntimeError(
-            "Pillow is inconsistent in this runtime. In Colab use the numbered notebook environment cell; "
-            "if it reports that Pillow was repaired or PIL was already loaded, restart the session once, "
-            "then rerun Cells 1→4 before indexing."
+            "Pillow is inconsistent in this runtime. "
+            "Rerun the notebook environment setup before image indexing."
         ) from error
 
 
@@ -50,7 +54,6 @@ def build_text_index(
     model_name: str = "BAAI/bge-small-en-v1.5",
     batch_size: int = 64,
 ) -> dict[str, Any]:
-    _assert_pillow_runtime()
     import faiss
     from sentence_transformers import SentenceTransformer
 
