@@ -309,6 +309,12 @@ geomapbench-eval run `
 geomapbench-eval analyze `
   --results results\qwen38_flash_base\responses.jsonl `
   --output results\qwen38_flash_base\analysis
+
+# Paired comparison: only records completed in both conditions contribute.
+geomapbench-eval compare `
+  --base-results results\qwen38_flash_base\responses.jsonl `
+  --rag-results results\qwen38_flash_rag\responses.jsonl `
+  --output results\qwen38_flash_comparison
 ```
 
 The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf

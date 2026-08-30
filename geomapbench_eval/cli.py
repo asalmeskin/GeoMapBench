@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from .analysis import add_analyze_parser, analyze
+from .analysis import add_analyze_parser, analyze, compare
 from .runner import add_run_parser, run, validate_run_args
 
 
@@ -15,8 +15,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         validate_run_args(args)
         print(json.dumps(run(args), indent=2, sort_keys=True))
-    else:
+    elif args.command == "analyze":
         print(json.dumps(analyze(__import__("pathlib").Path(args.results), __import__("pathlib").Path(args.output), make_plots=not args.no_plots), indent=2, sort_keys=True))
+    else:
+        print(json.dumps(compare(__import__("pathlib").Path(args.base_results), __import__("pathlib").Path(args.rag_results), __import__("pathlib").Path(args.output)), indent=2, sort_keys=True))
     return 0
 
 

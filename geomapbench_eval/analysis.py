@@ -79,8 +79,46 @@ def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dic
     return summary
 
 
+def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
+    """Compare two completed conditions by the same record IDs."""
+    def scored(path: Path) -> dict[str, dict[str, Any]]:
+        return {
+            str(row["id"]): row for row in read_jsonl(path)
+            if row.get("status") == "ok" and isinstance(row.get("score"), (int, float))
+        }
+    base, rag = scored(base_path), scored(rag_path)
+    common = sorted(set(base) & set(rag))
+    if not common:
+        raise ValueError("No common successful record IDs between base and RAG results")
+    rows = [{"id": record_id, "leaf": str(base[record_id].get("leaf", "unknown")), "base_score": float(base[record_id]["score"]), "rag_score": float(rag[record_id]["score"])} for record_id in common]
+    for row in rows:
+        row["delta"] = row["rag_score"] - row["base_score"]
+    by_leaf: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        by_leaf[row["leaf"]].append(row["delta"])
+    deltas = [row["delta"] for row in rows]
+    low, high = _ci(deltas)
+    summary = {
+        "paired_record_count": len(rows), "base_only_records": len(set(base) - set(rag)),
+        "rag_only_records": len(set(rag) - set(base)), "mean_delta": round(_mean(deltas), 4),
+        "delta_ci_low": round(low, 4), "delta_ci_high": round(high, 4),
+        "per_leaf_delta": {leaf: round(_mean(values), 4) for leaf, values in sorted(by_leaf.items())},
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_json(output / "rag_comparison.json", summary)
+    with (output / "rag_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["id", "leaf", "base_score", "rag_score", "delta"])
+        writer.writeheader(); writer.writerows(rows)
+    return summary
+
+
 def add_analyze_parser(sub: argparse._SubParsersAction[Any]) -> None:
     parser = sub.add_parser("analyze", help="Aggregate scored results into publication-ready tables with bootstrap CIs.")
     parser.add_argument("--results", required=True, help="responses.jsonl from one run")
     parser.add_argument("--output", required=True)
     parser.add_argument("--no-plots", action="store_true")
+
+    compare_parser = sub.add_parser("compare", help="Produce paired base-versus-RAG improvements by record ID.")
+    compare_parser.add_argument("--base-results", required=True)
+    compare_parser.add_argument("--rag-results", required=True)
+    compare_parser.add_argument("--output", required=True)
