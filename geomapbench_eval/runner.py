@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -43,11 +44,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "created_at": utc_now(), "model": args.model, "condition": args.condition,
         "temperature": args.temperature, "max_tokens": args.max_tokens, "benchmark_root": str(benchmark_root),
         "corpus_root": args.corpus_root, "top_k": args.top_k, "include_images": not args.no_images,
+        "per_leaf_limit": args.per_leaf_limit,
     }
     existing_config = output_root / "run_config.json"
     if existing_config.exists() and not args.force:
         previous = __import__("json").loads(existing_config.read_text(encoding="utf-8"))
-        for key in ("model", "condition", "temperature", "max_tokens", "benchmark_root", "corpus_root", "top_k", "include_images"):
+        for key in ("model", "condition", "temperature", "max_tokens", "benchmark_root", "corpus_root", "top_k", "include_images", "per_leaf_limit"):
             if previous.get(key) != run_config.get(key):
                 raise ValueError("Output directory has a different run configuration; choose a new --output or use --force.")
     atomic_json(existing_config, run_config)
@@ -56,6 +58,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     done = set() if args.force else completed_ids(result_path)
     records = benchmark_records(benchmark_root, prefer_clean=not args.no_clean)
     selected = [(directory, record) for directory, record in records if record.get("id") not in done]
+    if args.per_leaf_limit is not None:
+        counts: Counter[str] = Counter()
+        stratified: list[tuple[Path, dict[str, Any]]] = []
+        for directory, record in selected:
+            leaf = str(record.get("leaf", directory.name))
+            if counts[leaf] < args.per_leaf_limit:
+                stratified.append((directory, record))
+                counts[leaf] += 1
+        selected = stratified
     if args.limit:
         selected = selected[:args.limit]
     spent = 0.0
@@ -108,6 +119,7 @@ def add_run_parser(sub: argparse._SubParsersAction[Any]) -> None:
     parser.add_argument("--max-image-bytes", type=int, default=8_000_000)
     parser.add_argument("--max-cost-usd", type=float)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--per-leaf-limit", type=int, help="Evaluate at most this many records per leaf; use 1 for a 23-leaf pilot.")
     parser.add_argument("--no-images", action="store_true")
     parser.add_argument("--no-clean", action="store_true")
     parser.add_argument("--force", action="store_true", help="Ignore completed records; preserves existing result rows.")
@@ -116,3 +128,5 @@ def add_run_parser(sub: argparse._SubParsersAction[Any]) -> None:
 def validate_run_args(args: argparse.Namespace) -> None:
     if args.condition == "rag" and not args.corpus_root:
         raise ValueError("--corpus-root is required for --condition rag")
+    if args.per_leaf_limit is not None and args.per_leaf_limit < 1:
+        raise ValueError("--per-leaf-limit must be at least 1")

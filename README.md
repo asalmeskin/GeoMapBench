@@ -286,12 +286,12 @@ geomapbench-data validate --root C:\data\geomapbench_100 --require-all
 geomapbench-data bloom-audit --root C:\data\geomapbench_100
 geomapbench-data clean --root C:\data\geomapbench_100
 
-# Start with a 23-example pilot. Rerun the exact command to resume.
+# Start with a stratified 23-example pilot (one record per leaf).
 geomapbench-eval run `
   --benchmark-root C:\data\geomapbench_100 `
   --output results\qwen38_flash_base `
   --model qwen/qwen3.8-flash `
-  --condition base --limit 23 --max-cost-usd 10
+  --condition base --per-leaf-limit 1 --max-cost-usd 10
 
 # Full run after inspecting the pilot.
 geomapbench-eval run `
