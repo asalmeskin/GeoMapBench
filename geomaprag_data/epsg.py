@@ -36,7 +36,7 @@ def build_epsg(workspace: CorpusWorkspace, profile: BuildProfile, guard: Benchma
         return {"stage": "epsg", "written": 0, "cached_units": 1, "failed_units": []}
 
     # IMPORTANT: deduplicate *before* applying the profile limit so that an
-    # iclr profile asking for 6000 CRS candidates really gets up to 6000
+    # The publication profile can request up to 6000 CRS candidates.
     # distinct EPSG authority/code pairs.
     infos = _dedupe_epsg_infos(query_crs_info(auth_name="EPSG"))[: profile.epsg_max_records]
 

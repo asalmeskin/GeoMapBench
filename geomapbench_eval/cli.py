@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+import argparse
+import json
+
+from .analysis import add_analyze_parser, analyze
+from .runner import add_run_parser, run, validate_run_args
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Reproducible OpenRouter evaluation for GeoMapBench.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    add_run_parser(sub); add_analyze_parser(sub)
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        validate_run_args(args)
+        print(json.dumps(run(args), indent=2, sort_keys=True))
+    else:
+        print(json.dumps(analyze(__import__("pathlib").Path(args.results), __import__("pathlib").Path(args.output), make_plots=not args.no_plots), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

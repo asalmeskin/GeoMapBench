@@ -60,8 +60,8 @@ PROFILES: dict[str, BuildProfile] = {
         osm_map_radius_m=650,
         osm_tile_offset_m=600,
     ),
-    "iclr": BuildProfile(
-        name="iclr",
+    "publication": BuildProfile(
+        name="publication",
         wikipedia_seed_count=186,
         wikipedia_pages_per_seed=500,
         wikipedia_target_chunks=10_000,

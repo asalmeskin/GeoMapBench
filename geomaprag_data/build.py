@@ -33,7 +33,7 @@ def build_all(
     output: Path,
     *,
     benchmark_root: Path | None,
-    profile_name: str = "iclr",
+    profile_name: str = "publication",
     stages: set[str] | None = None,
     spatial_exclusion_km: float = 2.0,
 ) -> dict[str, Any]:

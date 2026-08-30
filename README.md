@@ -249,17 +249,17 @@ Do not randomly split individual questions after generating Bloom variants. Spli
 
 This repository also contains `geomaprag_data/`, a large, resume-safe retrieval-corpus builder designed to complement GeoMapBench evaluation. The full design is documented in [`GEOMAPRAG_DATA.md`](GEOMAPRAG_DATA.md), and the numbered Colab runner is [`notebooks/GeoMapRAG_Corpus_NUMBERED.ipynb`](notebooks/GeoMapRAG_Corpus_NUMBERED.ipynb).
 
-The `iclr` profile builds a fresh corpus from Wikipedia, Wikidata/QLever, GeoNames, World Bank, EPSG/PROJ, Wikimedia Commons, and OpenStreetMap. Existing materialized corpus files are never imported as source records. Every completed network/source unit is committed as an atomic shard, so interrupted Colab runs resume without discarding completed work. A benchmark-overlap guard filters exact text/source identifiers and nearby coordinates before RAG records are admitted.
+The `publication` profile builds a fresh corpus from Wikipedia, Wikidata/QLever, GeoNames, World Bank, EPSG/PROJ, Wikimedia Commons, and OpenStreetMap. Existing materialized corpus files are never imported as source records. Every completed network/source unit is committed as an atomic shard, so interrupted Colab runs resume without discarding completed work. A benchmark-overlap guard filters exact text/source identifiers and nearby coordinates before RAG records are admitted.
 
 ```bash
 geomaprag-data build \
   --output /content/drive/MyDrive/GeoMapRAG_Corpus \
   --benchmark-root /content/drive/MyDrive/GeoMapBench_Data/geomapbench_100 \
-  --profile iclr
+  --profile publication
 
 geomaprag-data validate \
   --root /content/drive/MyDrive/GeoMapRAG_Corpus \
-  --profile iclr \
+  --profile publication \
   --strict-scale
 
 geomaprag-data clean \
@@ -272,3 +272,55 @@ The benchmark cleaner lives in `geomapbench_data/clean_data.py` and is available
 ```bash
 geomapbench-data clean --root /path/to/geomapbench_100 --overwrite
 ```
+
+## Run GeoMapBench with OpenRouter
+
+`geomapbench_eval` is a resumable inference/evaluation harness. It never sends
+gold targets, source metadata, seeds, group IDs, or provenance to a model. It
+uses only the task input and the input assets, records raw model responses plus
+usage/latency, and scores locally. Keep your API key out of notebooks and Git:
+
+```powershell
+$env:OPENROUTER_API_KEY = "..."
+geomapbench-data validate --root C:\data\geomapbench_100 --require-all
+geomapbench-data bloom-audit --root C:\data\geomapbench_100
+geomapbench-data clean --root C:\data\geomapbench_100
+
+# Start with a 23-example pilot. Rerun the exact command to resume.
+geomapbench-eval run `
+  --benchmark-root C:\data\geomapbench_100 `
+  --output results\qwen38_flash_base `
+  --model qwen/qwen3.8-flash `
+  --condition base --limit 23 --max-cost-usd 10
+
+# Full run after inspecting the pilot.
+geomapbench-eval run `
+  --benchmark-root C:\data\geomapbench_100 `
+  --output results\qwen38_flash_base `
+  --model qwen/qwen3.8-flash --condition base
+
+# Deterministic lexical BM25 RAG baseline (requires an already validated corpus).
+geomapbench-eval run `
+  --benchmark-root C:\data\geomapbench_100 `
+  --corpus-root C:\data\GeoMapRAG_Corpus `
+  --output results\qwen38_flash_rag `
+  --model qwen/qwen3.8-flash --condition rag --top-k 5
+
+geomapbench-eval analyze `
+  --results results\qwen38_flash_base\responses.jsonl `
+  --output results\qwen38_flash_base\analysis
+```
+
+The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf
+bar chart and Bloom-level plot when Matplotlib is installed (pass `--no-plots`
+for a table-only run). The RAG condition deliberately starts with an inspectable lexical retriever.
+It is a baseline, not a claim of multimodal retrieval: test its retrieved IDs
+and retrieval metrics before attributing answer changes to RAG. The command
+writes a per-leaf CSV, macro averages, Bloom-level summary, format-failure
+rate, bootstrap confidence intervals, latency, and OpenRouter-reported cost.
+
+For a paper release, create a separate output directory per model/condition,
+pin the exact model ID, store the API response metadata, and do not use
+`--force` on a completed output directory: it intentionally reruns records and
+appends another immutable response row. Use `--no-images` only for a declared
+text-only ablation, never as the default comparison for visual leaves.

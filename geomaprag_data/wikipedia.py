@@ -38,7 +38,7 @@ def _pages(http: CachedHTTP, city: str, page_ids: list[int], batch_size: int = 5
     """Fetch page extracts in deterministic API-safe batches.
 
     MediaWiki limits the number of page IDs accepted by a normal client in one
-    request. Batching lets the ICLR profile retrieve substantially broader
+    request. Batching lets the publication profile retrieve substantially broader
     geographic context without relying on privileged API limits.
     """
     unique_ids = sorted(set(int(page_id) for page_id in page_ids))

@@ -26,7 +26,7 @@ def make_parser() -> argparse.ArgumentParser:
     build = sub.add_parser("build", help="Build/extend the corpus. Safe to rerun after interruption.")
     build.add_argument("--output", type=_path, required=True)
     build.add_argument("--benchmark-root", type=_path, required=False)
-    build.add_argument("--profile", choices=sorted(PROFILES), default="iclr")
+    build.add_argument("--profile", choices=sorted(PROFILES), default="publication")
     build.add_argument(
         "--stages",
         default="",

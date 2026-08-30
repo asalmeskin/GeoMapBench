@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator
 
 
-CORPUS_REVISION = "2026-08-23-geomaprag-iclr"
+CORPUS_REVISION = "2026-08-23-geomaprag-publication"
 DATASET_NAME = "GeoMapRAG"
 
 

@@ -13,7 +13,7 @@ from .common import atomic_write_json, read_jsonl, sha256_file, text_hash
 PROFILE_MINIMA: dict[str, dict[str, Any]] = {
     "smoke": {"total": 50, "map_image": 1},
     "standard": {"total": 12_000, "map_image": 200},
-    "iclr": {
+    "publication": {
         "total": 45_000,
         "map_image": 700,
         "sources": {
@@ -123,7 +123,7 @@ def validate_corpus(root: Path, *, profile: str | None = None, strict_scale: boo
                 message = f"scale target not met: {source_name} {sources.get(source_name, 0)} < {minimum}"
                 (errors if strict_scale else warnings).append(message)
 
-        if profile == "iclr":
+        if profile == "publication":
             required_geonames_classes = set("AHLPRSTUV")
             observed = set(geonames_classes)
             if observed != required_geonames_classes:
