@@ -4,236 +4,271 @@ import argparse
 import csv
 import json
 import re
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .analysis import analyze, compare
 from .common import atomic_json
+from .openrouter import OpenRouterClient
 from .preflight import benchmark_preflight
-from .rag import stage_corpus
+from .rag import AgenticRAGRetriever, DenseRAGRetriever, stage_corpus
 from .runner import run
 
 
-def _slug(model: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "_", model)
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("_")
 
 
-def _run_args(
-    *, benchmark_root: Path, output: Path, model: str, condition: str,
-    corpus_root: Path | None = None, per_leaf_limit: int | None = None,
-    max_cost_usd: float | None = None,
-    agent_model: str = "google/gemini-3.5-flash-lite",
+def _models(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not payload:
+        raise ValueError(f"Model config must be a non-empty JSON array: {path}")
+    rows = [row for row in payload if isinstance(row, dict) and row.get("enabled", True)]
+    for row in rows:
+        if not row.get("model"):
+            raise ValueError("Every model config row needs a model ID")
+    return rows
+
+
+def _model_row(path: Path, model: str) -> dict[str, Any]:
+    matches = [row for row in _models(path) if str(row["model"]) == model]
+    if len(matches) != 1:
+        raise ValueError(f"Expected exactly one config row for {model!r} in {path}, found {len(matches)}")
+    return matches[0]
+
+
+def _run_namespace(
+    args: argparse.Namespace,
+    *,
+    output: Path,
+    model: str,
+    condition: str,
+    max_tokens: int,
+    reasoning_effort: str,
 ) -> argparse.Namespace:
     return argparse.Namespace(
-        benchmark_root=str(benchmark_root), output=str(output), model=model,
-        condition=condition, corpus_root=str(corpus_root) if corpus_root else None,
-        rag_backend="dense", top_k=5, candidate_k=50,
-        reranker_model="BAAI/bge-reranker-base", max_passage_chars=1500,
-        max_context_chars=6000, no_capability_gating=False,
-        agent_model=agent_model, agent_max_hops=2, agent_subqueries=3,
-        temperature=0.0, max_tokens=512, timeout_seconds=120, retries=4,
-        max_image_bytes=8_000_000, max_cost_usd=max_cost_usd,
-        limit=None, per_leaf_limit=per_leaf_limit, no_images=False,
-        no_clean=False, force=False,
+        benchmark_root=args.benchmark_root,
+        output=str(output),
+        model=model,
+        condition=condition,
+        top_k=getattr(args, "top_k", 5),
+        temperature=0.0,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        timeout_seconds=180,
+        retries=4,
+        max_image_bytes=8_000_000,
+        max_cost_usd=getattr(args, "max_cost_usd_per_model", None),
+        limit=None,
+        per_leaf_limit=args.per_leaf_limit,
+        progress_every=args.progress_every,
+        no_images=False,
+        no_clean=False,
+        force=False,
+        benchmark_content_hash=getattr(args, "benchmark_content_hash", None),
     )
 
 
-def load_model_matrix(path: Path) -> list[dict[str, Any]]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    models = payload.get("models")
-    if not isinstance(models, list) or not 7 <= len(models) <= 8:
-        raise ValueError("Scientific model matrix must contain 7 or 8 models")
-    ids = [str(row.get("id")) for row in models]
-    if len(ids) != len(set(ids)) or any("/" not in model for model in ids):
-        raise ValueError("Model matrix contains a missing or duplicate OpenRouter model ID")
-    return models
-
-
-def openrouter_model_catalog(timeout: int = 30) -> dict[str, dict[str, Any]]:
-    request = urllib.request.Request(
-        "https://openrouter.ai/api/v1/models",
-        headers={"User-Agent": "GeoMapBench/1.7.1"},
+def _preflight(args: argparse.Namespace) -> dict[str, Any]:
+    cache = Path(args.preflight_cache).expanduser() if args.preflight_cache else Path(args.output) / "_preflight_cache"
+    return benchmark_preflight(
+        Path(args.benchmark_root), cache_root=cache,
+        force=args.force_preflight, max_image_bytes=8_000_000,
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return {str(row.get("id")): row for row in payload.get("data", []) if row.get("id")}
+
+
+def _catalog_check(model_rows: list[dict[str, Any]]) -> list[str]:
+    print("[suite] checking current OpenRouter model IDs", flush=True)
+    catalog = OpenRouterClient().model_catalog()
+    missing = [str(row["model"]) for row in model_rows if str(row["model"]) not in catalog]
+    if missing:
+        print(f"[suite:warning] unavailable model IDs will be skipped: {missing}", flush=True)
+    else:
+        print("[suite] model preflight PASS", flush=True)
+    return missing
 
 
 def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
-    benchmark_root, output = Path(args.benchmark_root), Path(args.output)
+    output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    print(f"[suite] output: {output.resolve()}", flush=True)
-    print("[suite] starting zero-cost benchmark/image preflight", flush=True)
-    preflight = benchmark_preflight(
-        benchmark_root, encode_assets=not args.skip_asset_preflight, progress=True,
-    )
-    atomic_json(output / "benchmark_preflight.json", preflight)
-    models = load_model_matrix(Path(args.models))
-    print(f"[suite] loaded {len(models)} configured models", flush=True)
+    print(f"[suite] output: {output}", flush=True)
+    preflight = _preflight(args)
+    args.benchmark_content_hash = preflight["portable_benchmark_hash"]
+    model_rows = _models(Path(args.models))
+    print(f"[suite] loaded {len(model_rows)} configured models", flush=True)
+    reports: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
     if not args.skip_model_preflight:
-        print("[suite] checking current OpenRouter model IDs and image capability", flush=True)
-        catalog = openrouter_model_catalog()
-        missing = [row["id"] for row in models if row["id"] not in catalog]
-        if missing:
-            raise ValueError(f"OpenRouter model IDs are no longer available: {missing}")
-        text_only = [
-            row["id"] for row in models
-            if (catalog[row["id"]].get("architecture") or {}).get("input_modalities")
-            and "image" not in (catalog[row["id"]].get("architecture") or {}).get("input_modalities", [])
-        ]
-        if text_only:
-            raise ValueError(f"Configured models no longer accept image input: {text_only}")
-        print("[suite] model preflight PASS", flush=True)
-    rows, failures = [], []
-    for model_index, item in enumerate(models, 1):
-        model = str(item["id"])
-        model_dir = output / _slug(model)
-        print(f"[suite {model_index}/{len(models)}] START {model}", flush=True)
+        missing = set(_catalog_check(model_rows))
+        failures.extend({"model": model, "error": "model_unavailable_in_catalog"} for model in sorted(missing))
+        model_rows = [row for row in model_rows if str(row["model"]) not in missing]
+    for index, model_row in enumerate(model_rows, 1):
+        model = str(model_row["model"])
+        print(f"[suite {index}/{len(model_rows)}] START {model}", flush=True)
+        model_output = output / _slug(model)
         try:
-            report = run(_run_args(
-                benchmark_root=benchmark_root, output=model_dir, model=model,
-                condition="base", per_leaf_limit=args.per_leaf_limit,
-                max_cost_usd=args.max_cost_usd_per_model,
-            ))
-            summary = analyze(model_dir / "responses.jsonl", model_dir / "analysis")
-            if summary["record_count"] == 0:
+            namespace = _run_namespace(
+                args,
+                output=model_output,
+                model=model,
+                condition="base",
+                max_tokens=int(model_row.get("max_tokens", args.max_tokens)),
+                reasoning_effort=str(model_row.get("reasoning_effort", "minimal")),
+            )
+            invocation = run(namespace)
+            summary = analyze(model_output / "responses.jsonl", model_output / "analysis")
+            condition = summary["condition_summary"].get("base", {})
+            macro = summary["macro_by_condition"].get("base", 0.0)
+            report = {
+                "model": model,
+                "family": model_row.get("family"),
+                "open_weights": bool(model_row.get("open_weights")),
+                "n": condition.get("n", 0),
+                "macro_accuracy": macro,
+                "text_answer_macro_accuracy": summary["text_answer_macro_by_condition"].get("base", 0.0),
+                "micro_accuracy": condition.get("micro_accuracy", 0.0),
+                "text_answer_micro_accuracy": condition.get("text_answer_micro_accuracy", 0.0),
+                "artifact_target_rate": condition.get("artifact_target_rate", 0.0),
+                "invalid_json_rate": condition.get("invalid_json_rate", 0.0),
+                "generation_failure_rate": condition.get("generation_failure_rate", 0.0),
+                "mean_latency_seconds": condition.get("mean_latency_seconds", 0.0),
+                "reported_cost_usd": condition.get("total_cost_usd", 0.0),
+                "run_stop_reason": invocation.get("run_stop_reason"),
+            }
+            if not report["n"]:
                 raise RuntimeError(f"{model} produced no successful records")
-            rows.append({
-                "model": model, "family": item.get("family"),
-                "open_weights": item.get("open_weights"),
-                "n": summary["record_count"],
-                "macro_accuracy": summary["macro_by_condition"].get("base"),
-                "micro_accuracy": summary["micro_by_condition"].get("base"),
-                "invalid_json_rate": summary["invalid_json_rate"],
-                "mean_latency_seconds": summary["mean_latency_seconds"],
-                "reported_cost_usd": summary["reported_cost_usd"],
-                "run_stop_reason": report.get("stop_reason"),
-            })
+            reports.append(report)
             print(
-                f"[suite {model_index}/{len(models)}] DONE {model}: "
-                f"{summary['record_count']} successful, {summary['error_row_count']} error rows, "
-                f"macro={summary['macro_by_condition'].get('base')}, ${summary['reported_cost_usd']:.4f}",
+                f"[suite {index}/{len(model_rows)}] DONE {model}: n={report['n']} "
+                f"macro={report['macro_accuracy']} invalid={report['invalid_json_rate']} "
+                f"generation_fail={report['generation_failure_rate']} ${report['reported_cost_usd']:.4f}",
                 flush=True,
             )
         except Exception as error:
             failures.append({"model": model, "error": repr(error)})
-            print(f"[suite {model_index}/{len(models)}] FAILED {model}: {error!r}", flush=True)
-            if args.fail_fast:
-                raise
+            print(f"[suite {index}/{len(model_rows)}] FAILED {model}: {error!r}", flush=True)
+    reports.sort(key=lambda row: (-float(row["macro_accuracy"]), float(row["reported_cost_usd"])))
     fieldnames = [
-        "model", "family", "open_weights", "n", "macro_accuracy",
-        "micro_accuracy", "invalid_json_rate", "mean_latency_seconds",
+        "model", "family", "open_weights", "n", "macro_accuracy", "text_answer_macro_accuracy",
+        "micro_accuracy", "text_answer_micro_accuracy", "artifact_target_rate",
+        "invalid_json_rate", "generation_failure_rate", "mean_latency_seconds",
         "reported_cost_usd", "run_stop_reason",
     ]
-    with (output / "model_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
+    with (output / "model_suite_summary.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader(); writer.writerows(rows)
-    result = {"models_requested": len(models), "models_reported": len(rows), "failures": failures, "rows": rows}
-    atomic_json(output / "model_comparison.json", result)
-    print(
-        f"[suite] finished: {len(rows)}/{len(models)} model reports; {len(failures)} model-level failures",
-        flush=True,
-    )
+        writer.writeheader(); writer.writerows(reports)
+    result = {"preflight": preflight, "models": reports, "failures": failures}
+    atomic_json(output / "model_suite_summary.json", result)
+    print(f"[suite] finished: {len(reports)}/{len(model_rows)} model reports", flush=True)
     return result
 
 
-def run_rag_experiment(args: argparse.Namespace) -> dict[str, Any]:
-    benchmark_root, output = Path(args.benchmark_root), Path(args.output)
+def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
+    output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    print(f"[rag-experiment] output: {output.resolve()}", flush=True)
-    print("[rag-experiment] starting zero-cost benchmark/image preflight", flush=True)
-    preflight = benchmark_preflight(
-        benchmark_root, encode_assets=not args.skip_asset_preflight, progress=True,
-    )
-    atomic_json(output / "benchmark_preflight.json", preflight)
-    corpus = Path(args.corpus_root)
-    if args.corpus_local_cache:
-        print(f"[rag-experiment] staging dense corpus/index into {args.corpus_local_cache}", flush=True)
-        corpus = stage_corpus(corpus, Path(args.corpus_local_cache))
-    base_dir = output / "base"
-    base_rag_dir = output / "base_rag"
-    agentic_rag_dir = output / "agentic_rag"
-    print("[rag-experiment 1/3] START base", flush=True)
-    base_report = run(_run_args(
-        benchmark_root=benchmark_root, output=base_dir, model=args.model,
-        condition="base", per_leaf_limit=args.per_leaf_limit,
-        max_cost_usd=args.max_cost_usd_per_condition,
-    ))
-    print("[rag-experiment 1/3] DONE base", flush=True)
-    print("[rag-experiment 2/3] START base_rag (dense + reranker; no BM25)", flush=True)
-    base_rag_report = run(_run_args(
-        benchmark_root=benchmark_root, output=base_rag_dir, model=args.model,
-        condition="base_rag", corpus_root=corpus, per_leaf_limit=args.per_leaf_limit,
-        max_cost_usd=args.max_cost_usd_per_condition,
-    ))
-    print("[rag-experiment 2/3] DONE base_rag", flush=True)
-    print("[rag-experiment 3/3] START agentic_rag (planner/judge + dense + reranker; no BM25)", flush=True)
-    agentic_rag_report = run(_run_args(
-        benchmark_root=benchmark_root, output=agentic_rag_dir, model=args.model,
-        condition="agentic_rag", corpus_root=corpus, per_leaf_limit=args.per_leaf_limit,
-        max_cost_usd=args.max_cost_usd_per_condition, agent_model=args.agent_model,
-    ))
-    print("[rag-experiment 3/3] DONE agentic_rag", flush=True)
-    base_analysis = analyze(base_dir / "responses.jsonl", base_dir / "analysis")
-    base_rag_analysis = analyze(base_rag_dir / "responses.jsonl", base_rag_dir / "analysis")
-    agentic_rag_analysis = analyze(agentic_rag_dir / "responses.jsonl", agentic_rag_dir / "analysis")
-    base_to_base_rag = compare(
-        base_dir / "responses.jsonl", base_rag_dir / "responses.jsonl", output / "comparisons/base_to_base_rag",
-    )
-    base_to_agentic_rag = compare(
-        base_dir / "responses.jsonl", agentic_rag_dir / "responses.jsonl", output / "comparisons/base_to_agentic_rag",
-    )
-    base_rag_to_agentic_rag = compare(
-        base_rag_dir / "responses.jsonl", agentic_rag_dir / "responses.jsonl", output / "comparisons/base_rag_to_agentic_rag",
-    )
+    print(f"[rag-suite] output: {output}", flush=True)
+    requested = [value.strip() for value in args.conditions.split(",") if value.strip()]
+    allowed = {"base_rag", "agentic_rag"}
+    if not requested or set(requested) - allowed:
+        raise ValueError(f"--conditions must be a comma-separated subset of {sorted(allowed)}")
+    model_row = _model_row(Path(args.models), args.model)
+    max_tokens = int(model_row.get("max_tokens", 8192))
+    reasoning_effort = str(model_row.get("reasoning_effort", "minimal"))
+    preflight = _preflight(args)
+    args.benchmark_content_hash = preflight["portable_benchmark_hash"]
+    local_corpus = stage_corpus(Path(args.corpus_root), Path(args.work_root) / "corpus")
+    reports: dict[str, Any] = {}
+    for condition in requested:
+        run_output = output / condition
+        namespace = _run_namespace(
+            args, output=run_output, model=args.model, condition=condition,
+            max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+        )
+        retriever = None
+        if condition == "base_rag":
+            retriever = DenseRAGRetriever(
+                local_corpus, candidate_k=args.candidate_k, rerank=not args.no_rerank,
+                max_passage_chars=args.max_passage_chars,
+                max_context_chars=args.max_context_chars,
+            )
+        elif condition == "agentic_rag":
+            retriever = AgenticRAGRetriever(
+                local_corpus,
+                candidate_k=args.candidate_k,
+                rerank=not args.no_rerank,
+                max_passage_chars=args.max_passage_chars,
+                max_context_chars=args.max_context_chars,
+                agent_model=args.agent_model,
+                agent_cache=Path(args.agent_cache).expanduser(),
+                agent_max_tokens=args.agent_max_tokens,
+                max_subqueries=args.agent_subqueries,
+                max_hops=args.agent_max_hops,
+            )
+        print(f"[rag-suite] START {condition}", flush=True)
+        invocation = run(namespace, retriever=retriever)
+        reports[condition] = {
+            "run": invocation,
+            "analysis": analyze(run_output / "responses.jsonl", run_output / "analysis"),
+        }
+        print(f"[rag-suite] DONE {condition}", flush=True)
+        del retriever
+    comparisons: dict[str, Any] = {}
+    if {"base_rag", "agentic_rag"}.issubset(requested):
+        try:
+            comparisons["base_rag_to_agentic_rag"] = compare(
+                output / "base_rag" / "responses.jsonl",
+                output / "agentic_rag" / "responses.jsonl",
+                output / "comparisons" / "base_rag_to_agentic_rag",
+            )
+        except ValueError as error:
+            comparisons["base_rag_to_agentic_rag"] = {
+                "protocol_validation": "deferred",
+                "reason": str(error),
+            }
+            print(f"[rag-suite] comparison deferred: {error}", flush=True)
     result = {
-        "model": args.model,
-        "agent_model": args.agent_model,
-        "retrieval": {
-            "base_rag": "BGE dense + cross-encoder reranking",
-            "agentic_rag": "LLM planner/judge + BGE dense + cross-encoder reranking",
-            "bm25": False,
-        },
-        "base_report": base_report,
-        "base_rag_report": base_rag_report,
-        "agentic_rag_report": agentic_rag_report,
-        "base_macro": base_analysis["macro_by_condition"].get("base"),
-        "base_rag_macro": base_rag_analysis["macro_by_condition"].get("base_rag"),
-        "agentic_rag_macro": agentic_rag_analysis["macro_by_condition"].get("agentic_rag"),
-        "comparisons": {
-            "base_to_base_rag": base_to_base_rag,
-            "base_to_agentic_rag": base_to_agentic_rag,
-            "base_rag_to_agentic_rag": base_rag_to_agentic_rag,
-        },
+        "preflight": preflight,
+        "model_config": model_row,
+        "reports": reports,
+        "comparisons": comparisons,
     }
-    atomic_json(output / "experiment_summary.json", result)
-    print(
-        f"[rag-experiment] finished: base={result['base_macro']}, "
-        f"base_rag={result['base_rag_macro']}, agentic_rag={result['agentic_rag_macro']}",
-        flush=True,
-    )
+    atomic_json(output / "rag_suite_summary.json", result)
     return result
 
 
 def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
-    suite = sub.add_parser("suite", help="Run and report the frozen 7-8 model base benchmark.")
+    suite = sub.add_parser("suite", help="Run the publication model suite with live logs.")
     suite.add_argument("--benchmark-root", required=True)
-    suite.add_argument("--output", required=True)
     suite.add_argument("--models", required=True)
-    suite.add_argument("--per-leaf-limit", type=int)
-    suite.add_argument("--max-cost-usd-per-model", type=float)
+    suite.add_argument("--output", required=True)
+    suite.add_argument("--preflight-cache")
+    suite.add_argument("--force-preflight", action="store_true")
     suite.add_argument("--skip-model-preflight", action="store_true")
-    suite.add_argument("--skip-asset-preflight", action="store_true")
-    suite.add_argument("--fail-fast", action="store_true")
+    suite.add_argument("--per-leaf-limit", type=int)
+    suite.add_argument("--max-tokens", type=int, default=8192)
+    suite.add_argument("--max-cost-usd-per-model", type=float, default=25.0)
+    suite.add_argument("--progress-every", type=int, default=5)
 
-    rag = sub.add_parser("rag-experiment", help="Run paired base, base_rag, and agentic_rag on one answer model.")
+    rag = sub.add_parser("rag-suite", help="Run dense base_rag and agentic_rag independently; comparisons are protocol-locked later.")
     rag.add_argument("--benchmark-root", required=True)
     rag.add_argument("--corpus-root", required=True)
-    rag.add_argument("--corpus-local-cache")
+    rag.add_argument("--work-root", required=True)
     rag.add_argument("--output", required=True)
-    rag.add_argument("--model", default="qwen/qwen3.8-flash")
-    rag.add_argument("--agent-model", default="google/gemini-3.5-flash-lite")
+    rag.add_argument("--models", required=True, help="The exact model matrix used by the Evaluation notebook")
+    rag.add_argument("--preflight-cache")
+    rag.add_argument("--force-preflight", action="store_true")
+    rag.add_argument("--model", required=True)
+    rag.add_argument("--conditions", default="base_rag,agentic_rag")
     rag.add_argument("--per-leaf-limit", type=int)
-    rag.add_argument("--max-cost-usd-per-condition", type=float)
-    rag.add_argument("--skip-asset-preflight", action="store_true")
+    rag.add_argument("--max-cost-usd-per-model", type=float, default=25.0)
+    rag.add_argument("--progress-every", type=int, default=5)
+    rag.add_argument("--top-k", type=int, default=5)
+    rag.add_argument("--candidate-k", type=int, default=40)
+    rag.add_argument("--max-passage-chars", type=int, default=1500)
+    rag.add_argument("--max-context-chars", type=int, default=6000)
+    rag.add_argument("--no-rerank", action="store_true")
+    rag.add_argument("--agent-model", default="google/gemini-3.5-flash-lite")
+    rag.add_argument("--agent-cache", required=True)
+    rag.add_argument("--agent-max-tokens", type=int, default=2048)
+    rag.add_argument("--agent-subqueries", type=int, default=3)
+    rag.add_argument("--agent-max-hops", type=int, default=2)

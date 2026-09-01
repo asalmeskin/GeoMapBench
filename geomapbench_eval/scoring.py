@@ -7,6 +7,9 @@ from collections import Counter
 from typing import Any
 
 
+SCORING_REVISION = "2026-09-structured-numeric-v2"
+
+
 def extract_answer(text: str) -> tuple[Any, str | None]:
     try:
         parsed = json.loads(text)
@@ -45,6 +48,41 @@ def _answer_target(record: dict[str, Any]) -> Any:
     return target
 
 
+def is_artifact_target(record: dict[str, Any]) -> bool:
+    """Flag variants whose gold answer is a file path rather than a JSON answer."""
+    gold = _answer_target(record)
+    suffixes = (".png", ".tif", ".tiff", ".geojson", ".json")
+    if isinstance(gold, str):
+        return gold.lower().endswith(suffixes)
+    if isinstance(gold, dict):
+        return any(isinstance(value, str) and value.lower().endswith(suffixes) for value in gold.values())
+    return False
+
+
+def _structured_equal(prediction: Any, gold: Any, *, tolerance: float, relative: float) -> bool:
+    if isinstance(gold, bool):
+        return isinstance(prediction, bool) and prediction is gold
+    if isinstance(gold, (int, float)) and not isinstance(gold, bool):
+        try:
+            return math.isclose(float(prediction), float(gold), abs_tol=tolerance, rel_tol=relative)
+        except (TypeError, ValueError):
+            return False
+    if isinstance(gold, dict):
+        if not isinstance(prediction, dict) or set(map(str, prediction)) != set(map(str, gold)):
+            return False
+        normalized_prediction = {str(key): value for key, value in prediction.items()}
+        return all(
+            _structured_equal(normalized_prediction[str(key)], value, tolerance=tolerance, relative=relative)
+            for key, value in gold.items()
+        )
+    if isinstance(gold, list):
+        return isinstance(prediction, list) and len(prediction) == len(gold) and all(
+            _structured_equal(p, g, tolerance=tolerance, relative=relative)
+            for p, g in zip(prediction, gold)
+        )
+    return _norm(prediction) == _norm(gold)
+
+
 def score(record: dict[str, Any], response_text: str) -> dict[str, Any]:
     prediction, parse_error = extract_answer(response_text)
     evaluation = record.get("evaluation") or {}
@@ -64,7 +102,9 @@ def score(record: dict[str, Any], response_text: str) -> dict[str, Any]:
         correct = 0.0 if not (sum(g.values()) + sum(p.values())) else 2 * overlap / (sum(g.values()) + sum(p.values()))
         return {"score": correct, "metric": kind, "parse_error": None, "gold_hash": _canonical(gold)}
     elif isinstance(gold, (dict, list)):
-        correct = _canonical(prediction) == _canonical(gold)
+        tolerance = float(evaluation.get("tolerance", evaluation.get("absolute_tolerance", 1e-6)))
+        relative = float(evaluation.get("relative_tolerance", 0.0))
+        correct = _structured_equal(prediction, gold, tolerance=tolerance, relative=relative)
     else:
         correct = _norm(prediction) == _norm(gold)
     return {"score": float(bool(correct)), "metric": kind, "parse_error": None, "gold_hash": _canonical(gold)}

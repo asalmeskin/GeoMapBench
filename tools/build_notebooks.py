@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+NOTEBOOKS = ROOT / "notebooks"
 
 
 def markdown(text: str) -> dict:
@@ -12,151 +13,249 @@ def markdown(text: str) -> dict:
 
 
 def code(text: str) -> dict:
-    return {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": text.splitlines(keepends=True)}
+    return {
+        "cell_type": "code", "execution_count": None, "metadata": {},
+        "outputs": [], "source": text.splitlines(keepends=True),
+    }
 
 
 def notebook(cells: list[dict]) -> dict:
     return {
         "cells": cells,
         "metadata": {
-            "colab": {"provenance": [], "gpuType": "T4"},
+            "accelerator": "GPU",
+            "colab": {"provenance": []},
             "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
             "language_info": {"name": "python", "version": "3"},
-            "accelerator": "GPU",
         },
         "nbformat": 4,
         "nbformat_minor": 5,
     }
 
 
-COMMON_CONFIG = '''# Edit only this cell, then use Runtime -> Run all.
-REPO_URL = "https://github.com/asalmeskin/GeoMapBench.git"
-GIT_REF = "main"  # For the paper, replace with the final v1.7.1 tag or commit SHA.
+EVALUATION = notebook([
+    markdown("""# GeoMapBench — publication model evaluation
+
+This notebook contains orchestration only. The evaluator, image conversion, scoring, resume logic, preflight cache, and reporting all live in the cloned codebase.
+
+Start with `PER_LEAF_LIMIT = 1`. Only after the pilot has zero generation failures and a near-zero invalid-JSON rate should you set it to `None` for all 2,300 examples per model."""),
+    code("""# EDIT ONLY THIS CELL
+GITHUB_REPO = "https://github.com/asalmeskin/GeoMapBench.git"
+GIT_REF = "v1.8.2"               # push this exact release tag before running
 
 BENCHMARK_ROOT = "/content/drive/MyDrive/GeoMapBench_Data/geomapbench_100"
 RESULTS_ROOT = "/content/drive/MyDrive/geomapbench_results_final"
+CACHE_ROOT = "/content/drive/MyDrive/geomapbench_runtime_cache"
 
-# Safe default: 1 = a 23-record pilot per model/condition. After it passes,
-# change this to None for the official full 23 x 100 evaluation.
-PER_LEAF_LIMIT = 1
-'''
-
-
-BOOTSTRAP = '''from google.colab import drive
+PER_LEAF_LIMIT = 1               # pilot: 1; full publication run: None
+MAX_COST_USD_PER_MODEL = 25.0
+MAX_TOKENS = 8192
+FORCE_PREFLIGHT = False           # True only when benchmark assets changed
+"""),
+    code("""from google.colab import drive
 drive.mount("/content/drive")
 
-import getpass, os, shlex, shutil, subprocess
+import os, shutil, subprocess, sys
 from pathlib import Path
-
-if not os.environ.get("OPENROUTER_API_KEY"):
-    os.environ["OPENROUTER_API_KEY"] = getpass.getpass("OPENROUTER_API_KEY: ")
-os.environ["PYTHONUNBUFFERED"] = "1"
-os.environ["GEOMAPBENCH_IMAGE_CACHE"] = "/content/geomapbench_image_cache"
-
-def run_live(command, *, cwd=None):
-    """Stream combined stdout/stderr so Colab always shows live progress."""
-    command = [str(part) for part in command]
-    print("\\nRunning:", shlex.join(command), flush=True)
-    process = subprocess.Popen(
-        command,
-        cwd=str(cwd) if cwd else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env=os.environ.copy(),
-    )
-    assert process.stdout is not None
-    for line in process.stdout:
-        print(line, end="", flush=True)
-    return_code = process.wait()
-    if return_code:
-        raise RuntimeError(
-            f"Command failed with exit code {return_code}: {shlex.join(command)}"
-        )
 
 repo = Path("/content/GeoMapBench")
 if repo.exists():
     shutil.rmtree(repo)
-run_live(["git", "clone", REPO_URL, str(repo)])
-run_live(["git", "-C", str(repo), "checkout", GIT_REF])
-print("checked out:", subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip())
-'''
+subprocess.run(
+    ["git", "clone", "--depth", "1", "--branch", GIT_REF, GITHUB_REPO, str(repo)],
+    check=True,
+)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo)], check=True)
 
+assert Path(BENCHMARK_ROOT).is_dir(), f"Benchmark not found: {BENCHMARK_ROOT}"
+Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
+Path(CACHE_ROOT).mkdir(parents=True, exist_ok=True)
+os.environ["GEOMAPBENCH_IMAGE_CACHE"] = str(Path(CACHE_ROOT) / "converted_images")
+os.environ["PYTHONUNBUFFERED"] = "1"
+print("Installed:", repo)
+"""),
+    code("""import getpass, os
+if not os.environ.get("OPENROUTER_API_KEY"):
+    os.environ["OPENROUTER_API_KEY"] = getpass.getpass("OPENROUTER_API_KEY: ")
+print("API key loaded in this runtime only.")
+"""),
+    code("""# Live logs are streamed directly into the cell.
+from pathlib import Path
+import subprocess
 
-def build() -> None:
-    simple = notebook([
-        markdown("# GeoMapBench — simple eight-model evaluation\n\nThis notebook contains no evaluator logic. It mounts Drive, clones a frozen code release, validates the canonical 23 × 100 benchmark, runs the model suite, and displays the report. Rerun after a disconnect to resume completed IDs."),
-        code(COMMON_CONFIG + '\nMAX_COST_USD_PER_MODEL = 25.0\n'),
-        code(BOOTSTRAP + '\nrun_live(["python", "-m", "pip", "install", "--disable-pip-version-check", "-e", str(repo)])\n'),
-        code('''models = repo / "config/evaluation_models_2026-09.json"
-output = Path(RESULTS_ROOT) / ("model_suite_full" if PER_LEAF_LIMIT is None else f"model_suite_{PER_LEAF_LIMIT}_per_leaf")
+models = repo / "config/evaluation_models_2026-09-v4.json"
+run_name = "model_suite_full_v4" if PER_LEAF_LIMIT is None else f"model_suite_{PER_LEAF_LIMIT}_per_leaf_v4"
+output = Path(RESULTS_ROOT) / run_name
 
 command = [
     "geomapbench-eval", "suite",
     "--benchmark-root", BENCHMARK_ROOT,
     "--models", str(models),
     "--output", str(output),
+    "--preflight-cache", str(Path(CACHE_ROOT) / "preflight"),
+    "--max-tokens", str(MAX_TOKENS),
     "--max-cost-usd-per-model", str(MAX_COST_USD_PER_MODEL),
+    "--progress-every", "5",
 ]
 if PER_LEAF_LIMIT is not None:
     command += ["--per-leaf-limit", str(PER_LEAF_LIMIT)]
-run_live(command)
-'''),
-        code('''import pandas as pd
-report = pd.read_csv(output / "model_comparison.csv")
-display(report.sort_values("macro_accuracy", ascending=False))
-print("Saved to:", output)
-'''),
-    ])
+if FORCE_PREFLIGHT:
+    command += ["--force-preflight"]
 
-    rag = notebook([
-        markdown("# GeoMapBench — Base, base_rag, and agentic_rag\n\nThis notebook contains no retrieval or evaluator implementation. It mounts Drive, clones a frozen code release, stages the existing corpus/index locally, and runs three paired conditions on one answer model. Both RAG conditions use dense BGE retrieval and reranking; neither uses BM25."),
-        code(COMMON_CONFIG + '''
+print("Running:", " ".join(command), flush=True)
+completed = subprocess.run(command, cwd=repo)
+if completed.returncode:
+    raise RuntimeError(f"GeoMapBench suite failed with exit code {completed.returncode}")
+print("Saved to:", output)
+"""),
+    code("""# Compact result table
+import json, pandas as pd
+summary_path = output / "model_suite_summary.json"
+summary = json.loads(summary_path.read_text())
+display(pd.DataFrame(summary["models"]))
+if summary["failures"]:
+    print("Model-level skips/failures:")
+    display(pd.DataFrame(summary["failures"]))
+print("Preflight cache hit:", summary["preflight"].get("cache_hit"))
+"""),
+    markdown("""## Moving from pilot to full run
+
+1. Confirm `generation_failure_rate == 0` for every retained model.
+2. Confirm invalid JSON is acceptably close to zero.
+3. Change `PER_LEAF_LIMIT` to `None` in the first cell and rerun from the command cell.
+
+The full run uses a different output directory. Completed full-run records are append-safe and skipped after a Colab reconnect."""),
+])
+
+
+RAG = notebook([
+    markdown("""# GeoMapBench — dense Base RAG and Agentic RAG
+
+This notebook runs only two retrieval conditions: dense retrieval plus reranking (`base_rag`) and agent-planned dense retrieval (`agentic_rag`). BM25 is not used anywhere in this pipeline.
+
+It is fully independent of the Evaluation notebook and can run concurrently on another computer. Fairness is enforced later by protocol-locked comparison of the saved run manifests and exact record IDs."""),
+    code("""# EDIT ONLY THIS CELL
+GITHUB_REPO = "https://github.com/asalmeskin/GeoMapBench.git"
+GIT_REF = "v1.8.2"
+
+BENCHMARK_ROOT = "/content/drive/MyDrive/GeoMapBench_Data/geomapbench_100"
 CORPUS_ROOT = "/content/drive/MyDrive/GeoMapRAG_Corpus"
+RESULTS_ROOT = "/content/drive/MyDrive/geomapbench_results_final"
+CACHE_ROOT = "/content/drive/MyDrive/geomapbench_runtime_cache"
+
 ANSWER_MODEL = "qwen/qwen3.8-flash"
 AGENT_MODEL = "google/gemini-3.5-flash-lite"
+CONDITIONS = "base_rag,agentic_rag"
+
+PER_LEAF_LIMIT = 1               # pilot first; None for the final paired run
 MAX_COST_USD_PER_CONDITION = 25.0
-'''),
-        code(BOOTSTRAP + '\nrun_live(["python", "-m", "pip", "install", "--disable-pip-version-check", "-e", f"{repo}[rag-index]"])\n'),
-        code('''output = Path(RESULTS_ROOT) / ("qwen38_rag_modes_full" if PER_LEAF_LIMIT is None else f"qwen38_rag_modes_{PER_LEAF_LIMIT}_per_leaf")
+FORCE_PREFLIGHT = False
+"""),
+    code("""from google.colab import drive
+drive.mount("/content/drive")
+
+import os, shutil, subprocess, sys
+from pathlib import Path
+
+repo = Path("/content/GeoMapBench")
+if repo.exists():
+    shutil.rmtree(repo)
+subprocess.run(
+    ["git", "clone", "--depth", "1", "--branch", GIT_REF, GITHUB_REPO, str(repo)],
+    check=True,
+)
+subprocess.run(
+    [sys.executable, "-m", "pip", "install", "-q", "-e", f"{repo}[rag-index]"],
+    check=True,
+)
+
+assert Path(BENCHMARK_ROOT).is_dir(), f"Benchmark not found: {BENCHMARK_ROOT}"
+assert Path(CORPUS_ROOT).is_dir(), f"RAG corpus not found: {CORPUS_ROOT}"
+for name in ("indexes/text.faiss", "indexes/text_metadata.jsonl"):
+    assert (Path(CORPUS_ROOT) / name).is_file(), f"Missing dense retrieval artifact: {name}"
+Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
+Path(CACHE_ROOT).mkdir(parents=True, exist_ok=True)
+os.environ["GEOMAPBENCH_IMAGE_CACHE"] = str(Path(CACHE_ROOT) / "converted_images")
+os.environ["PYTHONUNBUFFERED"] = "1"
+print("Installed:", repo)
+"""),
+    code("""import getpass, os
+if not os.environ.get("OPENROUTER_API_KEY"):
+    os.environ["OPENROUTER_API_KEY"] = getpass.getpass("OPENROUTER_API_KEY: ")
+print("API key loaded in this runtime only.")
+"""),
+    code("""# Live logs; corpus/index staging and all retrieval happen inside the codebase.
+from pathlib import Path
+import subprocess
+
+run_name = "rag_suite_full_v4" if PER_LEAF_LIMIT is None else f"rag_suite_{PER_LEAF_LIMIT}_per_leaf_v4"
+output = Path(RESULTS_ROOT) / run_name
+work_root = Path("/content/geomaprag_work")
+models = repo / "config/evaluation_models_2026-09-v4.json"
+
 command = [
-    "geomapbench-eval", "rag-experiment",
+    "geomapbench-eval", "rag-suite",
     "--benchmark-root", BENCHMARK_ROOT,
     "--corpus-root", CORPUS_ROOT,
-    "--corpus-local-cache", "/content/geomaprag_corpus",
+    "--work-root", str(work_root),
     "--output", str(output),
+    "--models", str(models),
+    "--preflight-cache", str(Path(CACHE_ROOT) / "preflight"),
+    "--agent-cache", str(Path(CACHE_ROOT) / "agent_cache"),
     "--model", ANSWER_MODEL,
     "--agent-model", AGENT_MODEL,
-    "--max-cost-usd-per-condition", str(MAX_COST_USD_PER_CONDITION),
+    "--conditions", CONDITIONS,
+    "--max-cost-usd-per-model", str(MAX_COST_USD_PER_CONDITION),
+    "--top-k", "5",
+    "--candidate-k", "40",
+    "--progress-every", "5",
 ]
 if PER_LEAF_LIMIT is not None:
     command += ["--per-leaf-limit", str(PER_LEAF_LIMIT)]
-run_live(command)
-'''),
-        code('''import json, pandas as pd
-summary = json.loads((output / "experiment_summary.json").read_text())
-comparisons = summary["comparisons"]
-display(pd.DataFrame([
-    {"condition": "base", "macro": summary["base_macro"], "delta_vs_base": 0.0},
-    {"condition": "base_rag", "macro": summary["base_rag_macro"], "delta_vs_base": comparisons["base_to_base_rag"]["mean_delta"]},
-    {"condition": "agentic_rag", "macro": summary["agentic_rag_macro"], "delta_vs_base": comparisons["base_to_agentic_rag"]["mean_delta"]},
-]))
-display(pd.DataFrame([
-    {"comparison": name, "n": value["paired_record_count"], "delta": value["mean_delta"], "ci_low": value["delta_ci_low"], "ci_high": value["delta_ci_high"]}
-    for name, value in comparisons.items()
-]))
-per_leaf = pd.read_csv(output / "comparisons/base_to_agentic_rag/rag_comparison.csv")
-display(per_leaf.groupby("leaf", as_index=False)["delta"].mean().sort_values("delta", ascending=False))
-print("Saved to:", output)
-'''),
-    ])
+if FORCE_PREFLIGHT:
+    command += ["--force-preflight"]
 
-    out = ROOT / "notebooks"
-    out.mkdir(exist_ok=True)
-    (out / "GeoMapBench_Simple_Evaluation.ipynb").write_text(json.dumps(simple, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    (out / "GeoMapBench_Final_RAG.ipynb").write_text(json.dumps(rag, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+print("Running:", " ".join(command), flush=True)
+completed = subprocess.run(command, cwd=repo)
+if completed.returncode:
+    raise RuntimeError(f"GeoMapBench RAG suite failed with exit code {completed.returncode}")
+print("Saved to:", output)
+"""),
+    code("""# Paired result summary
+import json, pandas as pd
+summary = json.loads((output / "rag_suite_summary.json").read_text())
+rows = []
+for condition, report in summary["reports"].items():
+    stats = report["analysis"]["condition_summary"][condition]
+    rows.append({"condition": condition, "macro_accuracy": report["analysis"]["macro_by_condition"][condition], **stats})
+display(pd.DataFrame(rows))
+
+if summary["comparisons"]:
+    display(pd.DataFrame([
+        {"condition": condition, **comparison}
+        for condition, comparison in summary["comparisons"].items()
+    ]))
+print("Preflight cache hit:", summary["preflight"].get("cache_hit"))
+"""),
+    markdown("""## Full paired run
+
+This notebook does not need any Evaluation output. After its own pilot has no generation failures, set `PER_LEAF_LIMIT = None` and run it independently. Rerunning after a disconnect skips completed RAG IDs.
+
+When both people finish, copy the desired Evaluation `responses.jsonl` together with its sibling `run_config.json` next to the RAG results and use `geomapbench-eval compare`. The comparison command refuses mismatched model settings, protocol revisions, benchmark hashes, subset definitions, or completed ID sets."""),
+])
+
+
+def main() -> None:
+    NOTEBOOKS.mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "GeoMapBench_Evaluation.ipynb": EVALUATION,
+        "GeoMapBench_RAG_Final.ipynb": RAG,
+    }
+    for name, value in outputs.items():
+        path = NOTEBOOKS / name
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        print(path)
 
 
 if __name__ == "__main__":
-    build()
+    main()

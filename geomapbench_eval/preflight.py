@@ -1,107 +1,164 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from geomapbench_data.common import N_EXAMPLES, SEEDS
+from .benchmark import canonical_benchmark_records
+from .common import atomic_json, stable_json, utc_now
+from .prompts import (
+    IMAGE_CONVERTER_REVISION, PROMPT_REVISION, input_asset_paths, input_document_paths,
+    transport_image,
+)
 
-from .common import digest, read_jsonl
-from .prompts import _assets, build_messages
+
+PREFLIGHT_REVISION = "2026-09-cache-v3-portable-hash"
 
 
-def canonical_benchmark_records(
-    root: Path, *, prefer_clean: bool = True, require_complete: bool = True,
-) -> list[tuple[Path, dict[str, Any]]]:
-    """Load only the immutable 23-leaf release, ignoring Drive copy folders."""
-    root = Path(root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"Benchmark root not found: {root}")
-    rows: list[tuple[Path, dict[str, Any]]] = []
-    for leaf in sorted(SEEDS):
-        task_dir = root / leaf
-        if not task_dir.is_dir():
-            raise FileNotFoundError(f"Missing canonical benchmark leaf: {leaf}")
-        clean = task_dir / "data_clean.jsonl"
-        raw = task_dir / "data.jsonl"
-        path = clean if prefer_clean and clean.exists() else raw
+def _sha256_file(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def _fingerprint(
+    benchmark_root: Path, records: list[tuple[Path, dict[str, Any]]]
+) -> tuple[str, list[tuple[str, Path]], list[tuple[str, Path]]]:
+    assets: dict[str, Path] = {}
+    documents: dict[str, Path] = {}
+    jsonl_stats: list[tuple[str, int, int]] = []
+    for task_dir, record in records:
+        for path in input_asset_paths(record, task_dir):
+            assets[str(path)] = path
+        for path in input_document_paths(record, task_dir):
+            documents[str(path)] = path
+    for leaf in sorted({directory.name for directory, _ in records}):
+        task_dir = benchmark_root / leaf
+        path = task_dir / "data_clean.jsonl"
         if not path.exists():
-            raise FileNotFoundError(path)
-        records = read_jsonl(path)
-        if require_complete and len(records) != N_EXAMPLES:
-            raise ValueError(f"{leaf}: expected {N_EXAMPLES} records, found {len(records)}")
-        rows.extend((task_dir, record) for record in records)
-    ids = [str(record.get("id")) for _, record in rows]
-    if len(ids) != len(set(ids)):
-        raise ValueError("Duplicate canonical benchmark record IDs detected")
-    return rows
+            path = task_dir / "data.jsonl"
+        stat = path.stat()
+        jsonl_stats.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+    asset_stats: list[tuple[str, int, int]] = []
+    for key, path in sorted(assets.items()):
+        stat = path.stat()
+        asset_stats.append((key, stat.st_size, stat.st_mtime_ns))
+    document_stats: list[tuple[str, int, int]] = []
+    for key, path in sorted(documents.items()):
+        stat = path.stat()
+        document_stats.append((key, stat.st_size, stat.st_mtime_ns))
+    payload = {
+        "revision": PREFLIGHT_REVISION,
+        "prompt_revision": PROMPT_REVISION,
+        "converter_revision": IMAGE_CONVERTER_REVISION,
+        "jsonl": jsonl_stats,
+        "assets": asset_stats,
+        "documents": document_stats,
+    }
+    fingerprint = hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
+    return (
+        fingerprint,
+        [(key, assets[key]) for key in sorted(assets)],
+        [(key, documents[key]) for key in sorted(documents)],
+    )
+
+
+def _target_warnings(records: list[tuple[Path, dict[str, Any]]]) -> dict[str, int]:
+    findings: Counter[str] = Counter()
+    for _, record in records:
+        target = record.get("target") or {}
+        path = str((record.get("evaluation") or {}).get("target_field") or "target.bloom_answer")
+        key = path.split(".", 1)[1] if path.startswith("target.") else "bloom_answer"
+        answer = target.get(key)
+        if isinstance(answer, str) and answer.lower().endswith((".png", ".tif", ".tiff", ".geojson", ".json")):
+            findings[str(record.get("leaf", "unknown"))] += 1
+        elif isinstance(answer, dict) and any(
+            isinstance(value, str) and value.lower().endswith((".png", ".tif", ".tiff", ".geojson", ".json"))
+            for value in answer.values()
+        ):
+            findings[str(record.get("leaf", "unknown"))] += 1
+    return dict(sorted(findings.items()))
 
 
 def benchmark_preflight(
-    root: Path, *, prefer_clean: bool = True, encode_assets: bool = True,
-    max_image_bytes: int = 8_000_000, progress: bool = False,
+    benchmark_root: Path,
+    *,
+    cache_root: Path | None = None,
+    force: bool = False,
+    max_image_bytes: int = 8_000_000,
 ) -> dict[str, Any]:
-    root = Path(root).expanduser().resolve()
-    rows = canonical_benchmark_records(root, prefer_clean=prefer_clean)
-    canonical = set(SEEDS)
-    directories = sorted(path.name for path in root.iterdir() if path.is_dir())
-    extras = [name for name in directories if name not in canonical]
-    counts = Counter(str(record.get("leaf", directory.name)) for directory, record in rows)
-    image_parts = 0
-    source_suffixes: Counter[str] = Counter()
-    if encode_assets:
-        grouped: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
-        for task_dir, record in rows:
-            grouped.setdefault(task_dir.name, []).append((task_dir, record))
-        if progress:
-            print(
-                f"[preflight] validating {len(rows)} records across {len(grouped)} canonical leaves; "
-                "TIFF/SVG renderings are cached locally",
-                flush=True,
-            )
-        for leaf_index, leaf in enumerate(sorted(grouped), 1):
-            leaf_images = 0
-            if progress:
+    benchmark_root = benchmark_root.expanduser().resolve()
+    records = canonical_benchmark_records(benchmark_root)
+    leaves = sorted({directory.name for directory, _ in records})
+    print(
+        f"[preflight] fingerprinting {len(records)} records across {len(leaves)} canonical leaves",
+        flush=True,
+    )
+    fingerprint, assets, documents = _fingerprint(benchmark_root, records)
+    cache_path = None
+    if cache_root:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_root / "benchmark_preflight.json"
+        if cache_path.exists() and not force:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("fingerprint") == fingerprint and cached.get("status") == "pass":
                 print(
-                    f"[preflight {leaf_index:02d}/{len(grouped)}] START {leaf} "
-                    f"({len(grouped[leaf])} records)",
+                    f"[preflight] CACHE HIT: {cached.get('image_count', 0)} assets were already validated; skipping conversion checks",
                     flush=True,
                 )
-            for record_index, (task_dir, record) in enumerate(grouped[leaf], 1):
-                for relative in _assets(record.get("input") or {}):
-                    if not relative.startswith(("http://", "https://")):
-                        source_suffixes[Path(relative).suffix.lower() or "<none>"] += 1
-                messages = build_messages(
-                    record, task_dir, include_images=True, max_image_bytes=max_image_bytes,
-                )
-                for message in messages:
-                    content = message.get("content")
-                    if isinstance(content, list):
-                        count = sum(part.get("type") == "image_url" for part in content)
-                        image_parts += count
-                        leaf_images += count
-                if progress and record_index % 25 == 0 and record_index < len(grouped[leaf]):
-                    print(
-                        f"[preflight {leaf_index:02d}/{len(grouped)}] {leaf}: "
-                        f"{record_index}/{len(grouped[leaf])} records checked",
-                        flush=True,
-                    )
-            if progress:
-                print(
-                    f"[preflight {leaf_index:02d}/{len(grouped)}] DONE {leaf}: "
-                    f"{len(grouped[leaf])} records, {leaf_images} image payloads OK",
-                    flush=True,
-                )
-        if progress:
-            print(f"[preflight] PASS: {image_parts} image payloads validated", flush=True)
-    return {
-        "benchmark_root": str(root),
-        "canonical_leaf_count": len(counts),
-        "record_count": len(rows),
-        "records_per_leaf": dict(sorted(counts.items())),
-        "extra_directories_ignored": extras,
-        "image_parts_validated": image_parts,
-        "source_image_suffixes": dict(sorted(source_suffixes.items())),
-        "record_id_digest": digest(sorted(str(record.get("id")) for _, record in rows)),
-        "valid": len(rows) == len(SEEDS) * N_EXAMPLES and set(counts.values()) == {N_EXAMPLES},
+                return {**cached, "cache_hit": True, "cache_path": str(cache_path)}
+    print(
+        f"[preflight] CACHE MISS: validating {len(assets)} unique image assets; SVG/TIFF conversions are cached",
+        flush=True,
+    )
+    by_leaf: Counter[str] = Counter()
+    for index, (path_text, path) in enumerate(assets, 1):
+        data, mime, _ = transport_image(path)
+        if len(data) > max_image_bytes:
+            raise ValueError(f"Converted image exceeds {max_image_bytes} bytes: {path_text}")
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            raise ValueError(f"Unsupported transport MIME {mime}: {path_text}")
+        try:
+            leaf = path.relative_to(benchmark_root).parts[0]
+        except ValueError:
+            leaf = "external"
+        by_leaf[leaf] += 1
+        if index % 100 == 0 or index == len(assets):
+            print(f"[preflight] {index}/{len(assets)} unique assets validated", flush=True)
+    report: dict[str, Any] = {
+        "status": "pass",
+        "created_at": utc_now(),
+        "fingerprint": fingerprint,
+        "record_count": len(records),
+        "leaf_count": len(leaves),
+        "image_count": len(assets),
+        "images_by_leaf": dict(sorted(by_leaf.items())),
+        "artifact_target_warnings": _target_warnings(records),
+        "portable_benchmark_hash": hashlib.sha256(stable_json({
+            "records": [record for _, record in records],
+            "assets": [
+                (str(path.relative_to(benchmark_root)), _sha256_file(path))
+                for _, path in assets
+            ],
+            "documents": [
+                (str(path.relative_to(benchmark_root)), _sha256_file(path))
+                for _, path in documents
+            ],
+        }).encode("utf-8")).hexdigest(),
+        "cache_hit": False,
     }
+    if cache_path:
+        atomic_json(cache_path, report)
+        report["cache_path"] = str(cache_path)
+    print(f"[preflight] PASS: {len(assets)} unique assets validated", flush=True)
+    if report["artifact_target_warnings"]:
+        print(
+            "[preflight:warning] some generated benchmark variants request file-like artifacts; "
+            "they remain in the run but should be reported separately in a paper",
+            flush=True,
+        )
+    return report

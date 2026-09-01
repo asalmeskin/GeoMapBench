@@ -54,41 +54,70 @@ def _plots(table: list[dict[str, Any]], bloom: dict[tuple[str, str], list[float]
 
 
 def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dict[str, Any]:
-    all_rows = read_jsonl(results_path)
-    rows = [row for row in all_rows if row.get("status") == "ok" and isinstance(row.get("score"), (int, float))]
+    rows = [row for row in read_jsonl(results_path) if row.get("status") == "ok" and isinstance(row.get("score"), (int, float))]
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(str(row.get("condition", "base")), str(row.get("leaf", "unknown")))].append(row)
     table: list[dict[str, Any]] = []
     for (condition, leaf), group in sorted(groups.items()):
         values = [float(item["score"]) for item in group]
+        text_rows = [item for item in group if not item.get("artifact_target")]
+        text_values = [float(item["score"]) for item in text_rows]
         low, high = _ci(values)
-        table.append({"condition": condition, "leaf": leaf, "n": len(group), "score": round(_mean(values), 4), "ci_low": round(low, 4), "ci_high": round(high, 4), "invalid_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4), "cost_usd": round(sum(float((item.get("usage") or {}).get("cost") or 0) for item in group), 6), "latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3)})
+        table.append({
+            "condition": condition, "leaf": leaf, "n": len(group),
+            "score": round(_mean(values), 4), "ci_low": round(low, 4), "ci_high": round(high, 4),
+            "text_answer_n": len(text_rows),
+            "text_answer_score": round(_mean(text_values), 4) if text_values else None,
+            "invalid_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4),
+            "generation_failure_rate": round(sum(bool(item.get("generation_failure")) for item in group) / len(group), 4),
+            "cost_usd": round(sum(
+                float((item.get("usage") or {}).get("cost") or 0)
+                + float((item.get("retrieval_usage") or {}).get("cost") or 0)
+                for item in group
+            ), 6),
+            "latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3),
+        })
     macro: dict[str, list[float]] = defaultdict(list)
+    text_macro: dict[str, list[float]] = defaultdict(list)
     bloom: dict[tuple[str, str], list[float]] = defaultdict(list)
     for row in table:
         macro[row["condition"]].append(row["score"])
+        if row["text_answer_score"] is not None:
+            text_macro[row["condition"]].append(float(row["text_answer_score"]))
     for row in rows:
         if row.get("bloom"):
             bloom[(str(row.get("condition")), str(row["bloom"]))].append(float(row["score"]))
     output.mkdir(parents=True, exist_ok=True)
-    micro: dict[str, list[float]] = defaultdict(list)
+    by_condition: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        micro[str(row.get("condition", "base"))].append(float(row["score"]))
+        by_condition[str(row.get("condition", "base"))].append(row)
+    condition_summary = {}
+    for condition, group in sorted(by_condition.items()):
+        condition_summary[condition] = {
+            "n": len(group),
+            "micro_accuracy": round(_mean([float(item["score"]) for item in group]), 4),
+            "invalid_json_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4),
+            "generation_failure_rate": round(sum(bool(item.get("generation_failure")) for item in group) / len(group), 4),
+            "artifact_target_rate": round(sum(bool(item.get("artifact_target")) for item in group) / len(group), 4),
+            "text_answer_micro_accuracy": round(_mean([
+                float(item["score"]) for item in group if not item.get("artifact_target")
+            ]), 4),
+            "mean_latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3),
+            "total_cost_usd": round(sum(
+                float((item.get("usage") or {}).get("cost") or 0)
+                + float((item.get("retrieval_usage") or {}).get("cost") or 0)
+                for item in group
+            ), 6),
+        }
     summary = {
         "record_count": len(rows),
-        "models": sorted({str(row.get("model")) for row in rows}),
         "macro_by_condition": {key: round(_mean(value), 4) for key, value in sorted(macro.items())},
-        "micro_by_condition": {key: round(_mean(value), 4) for key, value in sorted(micro.items())},
-        "micro_ci_by_condition": {key: [round(x, 4) for x in _ci(value)] for key, value in sorted(micro.items())},
+        "text_answer_macro_by_condition": {key: round(_mean(value), 4) for key, value in sorted(text_macro.items())},
+        "condition_summary": condition_summary,
         "bloom_by_condition": {f"{condition}:{level}": round(_mean(value), 4) for (condition, level), value in sorted(bloom.items())},
-        "invalid_json_rate": round(sum(bool(row.get("parse_error")) for row in rows) / max(1, len(rows)), 4),
-        "reported_cost_usd": round(sum(float(row.get("total_cost_usd") or (row.get("usage") or {}).get("cost") or 0) for row in all_rows), 6),
-        "answer_cost_usd": round(sum(float(row.get("answer_cost_usd") or (row.get("usage") or {}).get("cost") or 0) for row in all_rows), 6),
-        "agent_cost_usd": round(sum(float(row.get("agent_cost_usd") or 0) for row in all_rows), 6),
-        "error_row_count": sum(row.get("status") == "error" for row in all_rows),
-        "mean_latency_seconds": round(_mean([float(row.get("latency_seconds") or 0) for row in rows]), 3),
-        "per_leaf": table, "plots": _plots(table, bloom, output) if make_plots else [],
+        "per_leaf": table,
+        "plots": _plots(table, bloom, output) if make_plots else [],
     }
     atomic_json(output / "summary.json", summary)
     with (output / "per_leaf.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -99,6 +128,33 @@ def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dic
 
 def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     """Compare two completed conditions by the same record IDs."""
+    fairness_fields = (
+        "model", "temperature", "max_tokens", "reasoning_effort", "top_k",
+        "include_images", "per_leaf_limit", "limit", "target_record_count",
+        "selected_ids_hash", "selected_records_hash", "protocol",
+        "benchmark_content_hash",
+    )
+
+    def run_config(path: Path) -> dict[str, Any]:
+        config_path = path.parent / "run_config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(
+                f"Missing run_config.json beside {path}; protocol-locked comparison is impossible"
+            )
+        return __import__("json").loads(config_path.read_text(encoding="utf-8"))
+
+    first_config, second_config = run_config(base_path), run_config(rag_path)
+    mismatches = [
+        f"{field}: {first_config.get(field)!r} != {second_config.get(field)!r}"
+        for field in fairness_fields
+        if first_config.get(field) != second_config.get(field)
+    ]
+    if mismatches:
+        raise ValueError(
+            "Runs are not evaluation-protocol compatible; comparison refused.\n - "
+            + "\n - ".join(mismatches)
+        )
+
     def scored(path: Path) -> dict[str, dict[str, Any]]:
         return {
             str(row["id"]): row for row in read_jsonl(path)
@@ -108,6 +164,11 @@ def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     common = sorted(set(base) & set(rag))
     if not common:
         raise ValueError("No common successful record IDs between base and RAG results")
+    if set(base) != set(rag):
+        raise ValueError(
+            "Runs do not contain the exact same completed record IDs; comparison refused "
+            f"(first_only={len(set(base) - set(rag))}, second_only={len(set(rag) - set(base))})"
+        )
     rows = [{"id": record_id, "leaf": str(base[record_id].get("leaf", "unknown")), "base_score": float(base[record_id]["score"]), "rag_score": float(rag[record_id]["score"])} for record_id in common]
     for row in rows:
         row["delta"] = row["rag_score"] - row["base_score"]
@@ -117,18 +178,14 @@ def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     deltas = [row["delta"] for row in rows]
     low, high = _ci(deltas)
     summary = {
+        "protocol_validation": "pass",
+        "first_condition": first_config.get("condition"),
+        "second_condition": second_config.get("condition"),
         "paired_record_count": len(rows), "base_only_records": len(set(base) - set(rag)),
         "rag_only_records": len(set(rag) - set(base)), "mean_delta": round(_mean(deltas), 4),
         "delta_ci_low": round(low, 4), "delta_ci_high": round(high, 4),
         "per_leaf_delta": {leaf: round(_mean(values), 4) for leaf, values in sorted(by_leaf.items())},
     }
-    for label, predicate in {
-        "rag_applicable": lambda row: bool(rag[row["id"]].get("rag_applicable")),
-        "rag_not_applicable": lambda row: not bool(rag[row["id"]].get("rag_applicable")),
-    }.items():
-        subset = [row["delta"] for row in rows if predicate(row)]
-        ci = _ci(subset) if subset else (0.0, 0.0)
-        summary[label] = {"n": len(subset), "mean_delta": round(_mean(subset), 4), "ci": [round(x, 4) for x in ci]}
     output.mkdir(parents=True, exist_ok=True)
     atomic_json(output / "rag_comparison.json", summary)
     with (output / "rag_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
