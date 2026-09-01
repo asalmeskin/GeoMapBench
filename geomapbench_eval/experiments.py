@@ -50,31 +50,46 @@ def load_model_matrix(path: Path) -> list[dict[str, Any]]:
     return models
 
 
-def available_openrouter_models(timeout: int = 30) -> set[str]:
+def openrouter_model_catalog(timeout: int = 30) -> dict[str, dict[str, Any]]:
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/models",
-        headers={"User-Agent": "GeoMapBench/1.7"},
+        headers={"User-Agent": "GeoMapBench/1.7.1"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    return {str(row.get("id")) for row in payload.get("data", [])}
+    return {str(row.get("id")): row for row in payload.get("data", []) if row.get("id")}
 
 
 def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_root, output = Path(args.benchmark_root), Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    preflight = benchmark_preflight(benchmark_root, encode_assets=not args.skip_asset_preflight)
+    print(f"[suite] output: {output.resolve()}", flush=True)
+    print("[suite] starting zero-cost benchmark/image preflight", flush=True)
+    preflight = benchmark_preflight(
+        benchmark_root, encode_assets=not args.skip_asset_preflight, progress=True,
+    )
     atomic_json(output / "benchmark_preflight.json", preflight)
     models = load_model_matrix(Path(args.models))
+    print(f"[suite] loaded {len(models)} configured models", flush=True)
     if not args.skip_model_preflight:
-        available = available_openrouter_models()
-        missing = [row["id"] for row in models if row["id"] not in available]
+        print("[suite] checking current OpenRouter model IDs and image capability", flush=True)
+        catalog = openrouter_model_catalog()
+        missing = [row["id"] for row in models if row["id"] not in catalog]
         if missing:
             raise ValueError(f"OpenRouter model IDs are no longer available: {missing}")
+        text_only = [
+            row["id"] for row in models
+            if (catalog[row["id"]].get("architecture") or {}).get("input_modalities")
+            and "image" not in (catalog[row["id"]].get("architecture") or {}).get("input_modalities", [])
+        ]
+        if text_only:
+            raise ValueError(f"Configured models no longer accept image input: {text_only}")
+        print("[suite] model preflight PASS", flush=True)
     rows, failures = [], []
-    for item in models:
+    for model_index, item in enumerate(models, 1):
         model = str(item["id"])
         model_dir = output / _slug(model)
+        print(f"[suite {model_index}/{len(models)}] START {model}", flush=True)
         try:
             report = run(_run_args(
                 benchmark_root=benchmark_root, output=model_dir, model=model,
@@ -82,6 +97,8 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 max_cost_usd=args.max_cost_usd_per_model,
             ))
             summary = analyze(model_dir / "responses.jsonl", model_dir / "analysis")
+            if summary["record_count"] == 0:
+                raise RuntimeError(f"{model} produced no successful records")
             rows.append({
                 "model": model, "family": item.get("family"),
                 "open_weights": item.get("open_weights"),
@@ -93,8 +110,15 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 "reported_cost_usd": summary["reported_cost_usd"],
                 "run_stop_reason": report.get("stop_reason"),
             })
+            print(
+                f"[suite {model_index}/{len(models)}] DONE {model}: "
+                f"{summary['record_count']} successful, {summary['error_row_count']} error rows, "
+                f"macro={summary['macro_by_condition'].get('base')}, ${summary['reported_cost_usd']:.4f}",
+                flush=True,
+            )
         except Exception as error:
             failures.append({"model": model, "error": repr(error)})
+            print(f"[suite {model_index}/{len(models)}] FAILED {model}: {error!r}", flush=True)
             if args.fail_fast:
                 raise
     fieldnames = [
@@ -107,35 +131,50 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
         writer.writeheader(); writer.writerows(rows)
     result = {"models_requested": len(models), "models_reported": len(rows), "failures": failures, "rows": rows}
     atomic_json(output / "model_comparison.json", result)
+    print(
+        f"[suite] finished: {len(rows)}/{len(models)} model reports; {len(failures)} model-level failures",
+        flush=True,
+    )
     return result
 
 
 def run_rag_experiment(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_root, output = Path(args.benchmark_root), Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    preflight = benchmark_preflight(benchmark_root, encode_assets=not args.skip_asset_preflight)
+    print(f"[rag-experiment] output: {output.resolve()}", flush=True)
+    print("[rag-experiment] starting zero-cost benchmark/image preflight", flush=True)
+    preflight = benchmark_preflight(
+        benchmark_root, encode_assets=not args.skip_asset_preflight, progress=True,
+    )
     atomic_json(output / "benchmark_preflight.json", preflight)
     corpus = Path(args.corpus_root)
     if args.corpus_local_cache:
+        print(f"[rag-experiment] staging dense corpus/index into {args.corpus_local_cache}", flush=True)
         corpus = stage_corpus(corpus, Path(args.corpus_local_cache))
     base_dir = output / "base"
     base_rag_dir = output / "base_rag"
     agentic_rag_dir = output / "agentic_rag"
+    print("[rag-experiment 1/3] START base", flush=True)
     base_report = run(_run_args(
         benchmark_root=benchmark_root, output=base_dir, model=args.model,
         condition="base", per_leaf_limit=args.per_leaf_limit,
         max_cost_usd=args.max_cost_usd_per_condition,
     ))
+    print("[rag-experiment 1/3] DONE base", flush=True)
+    print("[rag-experiment 2/3] START base_rag (dense + reranker; no BM25)", flush=True)
     base_rag_report = run(_run_args(
         benchmark_root=benchmark_root, output=base_rag_dir, model=args.model,
         condition="base_rag", corpus_root=corpus, per_leaf_limit=args.per_leaf_limit,
         max_cost_usd=args.max_cost_usd_per_condition,
     ))
+    print("[rag-experiment 2/3] DONE base_rag", flush=True)
+    print("[rag-experiment 3/3] START agentic_rag (planner/judge + dense + reranker; no BM25)", flush=True)
     agentic_rag_report = run(_run_args(
         benchmark_root=benchmark_root, output=agentic_rag_dir, model=args.model,
         condition="agentic_rag", corpus_root=corpus, per_leaf_limit=args.per_leaf_limit,
         max_cost_usd=args.max_cost_usd_per_condition, agent_model=args.agent_model,
     ))
+    print("[rag-experiment 3/3] DONE agentic_rag", flush=True)
     base_analysis = analyze(base_dir / "responses.jsonl", base_dir / "analysis")
     base_rag_analysis = analyze(base_rag_dir / "responses.jsonl", base_rag_dir / "analysis")
     agentic_rag_analysis = analyze(agentic_rag_dir / "responses.jsonl", agentic_rag_dir / "analysis")
@@ -169,6 +208,11 @@ def run_rag_experiment(args: argparse.Namespace) -> dict[str, Any]:
         },
     }
     atomic_json(output / "experiment_summary.json", result)
+    print(
+        f"[rag-experiment] finished: base={result['base_macro']}, "
+        f"base_rag={result['base_rag_macro']}, agentic_rag={result['agentic_rag_macro']}",
+        flush=True,
+    )
     return result
 
 

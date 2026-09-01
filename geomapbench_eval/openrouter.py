@@ -34,33 +34,47 @@ class OpenRouterClient:
             "max_tokens": config.max_tokens,
             "response_format": {"type": "json_object"},
         }
-        data = json.dumps(payload).encode("utf-8")
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json", "HTTP-Referer": "https://github.com/GeoMapBench", "X-Title": "GeoMapBench"}
         last_error: Exception | None = None
         for attempt in range(config.retries + 1):
-            started = time.monotonic()
-            try:
-                request = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
-                with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
-                    raw = response.read().decode("utf-8")
-                result = json.loads(raw)
-                result["_latency_seconds"] = round(time.monotonic() - started, 3)
-                return result
-            except urllib.error.HTTPError as error:
-                body = error.read().decode("utf-8", errors="replace")
-                retryable = error.code in {408, 409, 429} or 500 <= error.code < 600
-                if not retryable:
-                    raise RuntimeError(f"OpenRouter HTTP {error.code}: {body[:1500]}") from error
-                last_error = error
-                if attempt == config.retries:
+            retry_after = None
+            while True:
+                started = time.monotonic()
+                data = json.dumps(payload).encode("utf-8")
+                try:
+                    request = urllib.request.Request(self.endpoint, data=data, headers=headers, method="POST")
+                    with urllib.request.urlopen(request, timeout=config.timeout_seconds) as response:
+                        raw = response.read().decode("utf-8")
+                    result = json.loads(raw)
+                    result["_latency_seconds"] = round(time.monotonic() - started, 3)
+                    return result
+                except urllib.error.HTTPError as error:
+                    body = error.read().decode("utf-8", errors="replace")
+                    lower_body = body.lower()
+                    incompatible_json_mode = (
+                        error.code == 400
+                        and "response_format" in payload
+                        and ("response_format" in lower_body or "json_object" in lower_body)
+                    )
+                    if incompatible_json_mode:
+                        payload.pop("response_format", None)
+                        print(
+                            f"[openrouter] {config.model} rejected JSON mode; retrying once with prompt-only JSON",
+                            flush=True,
+                        )
+                        continue
+                    retryable = error.code in {408, 409, 429} or 500 <= error.code < 600
+                    if not retryable:
+                        raise RuntimeError(f"OpenRouter HTTP {error.code}: {body[:1500]}") from error
+                    last_error = error
+                    retry_after = getattr(error, "headers", {}).get("Retry-After") if getattr(error, "headers", None) else None
                     break
-                retry_after = getattr(error, "headers", {}).get("Retry-After") if getattr(error, "headers", None) else None
-                time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else min(30.0, 2.0 ** attempt))
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-                last_error = error
-                if attempt == config.retries:
+                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+                    last_error = error
                     break
-                time.sleep(min(30.0, 2.0 ** attempt))
+            if attempt == config.retries:
+                break
+            time.sleep(float(retry_after) if retry_after and retry_after.isdigit() else min(30.0, 2.0 ** attempt))
         raise RuntimeError(f"OpenRouter request failed after {config.retries + 1} attempts: {last_error}")
 
 

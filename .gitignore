@@ -1,3 +1,8 @@
 /tests/test_eval.py
 __pycache__/
 *.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+geomapbench_image_cache/

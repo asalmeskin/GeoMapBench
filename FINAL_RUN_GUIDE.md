@@ -3,11 +3,25 @@
 ## Before Colab
 
 1. Replace the contents of the GitHub repository with this release, commit a clean
-   tree, and create tag `v1.7.0`. In both notebooks set `GIT_REF = "v1.7.0"`.
+   tree, and create tag `v1.7.1`. In both notebooks set `GIT_REF = "v1.7.1"`.
 2. Keep the benchmark and GeoMapRAG corpus in Drive. They are data artifacts and
    are intentionally not duplicated inside the code ZIP.
 3. Do not put `OPENROUTER_API_KEY` in GitHub or Drive files. The notebooks request
    it with a hidden prompt for each fresh runtime.
+
+The supplied notebooks already use the current benchmark path:
+`/content/drive/MyDrive/GeoMapBench_Data/geomapbench_100`. They stream clone,
+installation, preflight, per-model/per-condition, record progress, errors, and
+cost logs live in Colab.
+
+## Image transport preflight
+
+The canonical Drive release contains PNG, JPEG, SVG, and 494 TIFF/GeoTIFF assets.
+Before any paid call, the evaluator validates all referenced images. SVG icons and
+TIFF rasters are rendered to supported PNG payloads and cached under
+`GEOMAPBENCH_IMAGE_CACHE`; high-dynamic-range satellite TIFFs receive a visible
+2nd--98th percentile stretch. Direct PNG/JPEG/WEBP/GIF files are checked against
+their binary signatures. Do not use `--skip-asset-preflight` for official runs.
 
 ## Duplicate benchmark folders
 
@@ -18,7 +32,7 @@ such as `dense_land_cover_labeling (1)` from silently increasing the run to 2,50
 
 The command does not delete Drive content. If the extra folders still appear in
 the report, move them to Trash in Drive when logged in as their owner. Keeping them
-is harmless to evaluation correctness in release 1.7.0, but removing them makes the
+is harmless to evaluation correctness in release 1.7.1, but removing them makes the
 Drive layout less confusing.
 
 ## Recommended order

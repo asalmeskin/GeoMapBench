@@ -106,6 +106,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     succeeded = failed = 0
     attempted = 0
     stop_reason = None
+    print(
+        f"[run] model={args.model} condition={args.condition} | "
+        f"completed={len(done)} remaining={len(selected)} | output={output_root}",
+        flush=True,
+    )
+    if not selected:
+        print("[run] nothing to do; all selected record IDs are already complete", flush=True)
     for index, (task_dir, record) in enumerate(selected, 1):
         if args.max_cost_usd is not None and prior_spent + spent >= args.max_cost_usd:
             stop_reason = "max_cost_usd"
@@ -157,8 +164,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "agent_cost_usd": agent_cost, "total_cost_usd": agent_cost,
             })
             failed += 1
-        if index % 10 == 0:
-            print(f"{index}/{len(selected)} attempted | {succeeded} ok | {failed} errors | ${spent:.4f}")
+            print(f"[run:error] {record_id}: {error!r}", flush=True)
+        if index == 1 or index % 10 == 0 or index == len(selected):
+            print(
+                f"[run] {index}/{len(selected)} attempted | {succeeded} ok | "
+                f"{failed} errors | ${spent:.4f}",
+                flush=True,
+            )
     report = {
         "selected_remaining": len(selected), "attempted": attempted,
         "succeeded": succeeded, "failed": failed,
@@ -169,6 +181,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "stop_reason": stop_reason, "results": str(result_path),
     }
     atomic_json(output_root / "run_summary.json", report)
+    print(
+        f"[run] complete | attempted={attempted} ok={succeeded} errors={failed} "
+        f"total_cost=${prior_spent + spent:.4f} stop_reason={stop_reason}",
+        flush=True,
+    )
     return report
 
 

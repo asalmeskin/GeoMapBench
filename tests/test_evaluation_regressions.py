@@ -11,7 +11,7 @@ from geomapbench_data.common import SEEDS
 from geomapbench_eval.preflight import canonical_benchmark_records
 from geomapbench_eval.prompts import _encode_image
 from geomapbench_eval.openrouter import OpenRouterClient, OpenRouterConfig
-from geomapbench_eval.rag import AgenticRAGRetriever
+from geomapbench_eval.rag import AgenticRAGRetriever, stage_corpus
 from geomapbench_eval.runner import select_records
 from geomapbench_eval import runner
 
@@ -41,6 +41,44 @@ def test_svg_is_rasterized_to_supported_png(tmp_path: Path) -> None:
     assert base64.b64decode(payload).startswith(b"\x89PNG")
 
 
+def test_high_dynamic_range_tiff_is_cached_as_visible_png(tmp_path: Path, monkeypatch) -> None:
+    import numpy as np
+    import rasterio
+    from PIL import Image
+    from rasterio.transform import from_origin
+
+    monkeypatch.setenv("GEOMAPBENCH_IMAGE_CACHE", str(tmp_path / "cache"))
+    path = tmp_path / "scene.tif"
+    y, x = np.mgrid[0:64, 0:64]
+    bands = np.stack([1000 + x * 70, 500 + y * 80, 1500 + (x + y) * 35]).astype(np.uint16)
+    with rasterio.open(
+        path, "w", driver="GTiff", width=64, height=64, count=3,
+        dtype="uint16", crs="EPSG:4326", transform=from_origin(8, 48, .001, .001),
+    ) as dataset:
+        dataset.write(bands)
+    first = _encode_image(path, 8_000_000)
+    second = _encode_image(path, 8_000_000)
+    assert first == second
+    prefix, payload = first["image_url"]["url"].split(",", 1)
+    assert prefix == "data:image/png;base64"
+    image = Image.open(io.BytesIO(base64.b64decode(payload)))
+    assert image.mode == "RGB"
+    assert np.asarray(image).max() > 200
+    assert np.asarray(image).std() > 20
+    assert len(list((tmp_path / "cache").glob("*.png"))) == 1
+
+
+def test_direct_image_extension_must_match_file_signature(tmp_path: Path) -> None:
+    path = tmp_path / "broken.png"
+    path.write_bytes(b"not a PNG")
+    try:
+        _encode_image(path, 8_000_000)
+    except ValueError as error:
+        assert "do not match declared MIME" in str(error)
+    else:
+        raise AssertionError("Expected corrupt image bytes to fail before an API call")
+
+
 def test_subset_is_frozen_before_resume_filtering(tmp_path: Path) -> None:
     rows = []
     for leaf in ("a", "b"):
@@ -48,6 +86,27 @@ def test_subset_is_frozen_before_resume_filtering(tmp_path: Path) -> None:
             rows.append((tmp_path / leaf, {"id": f"{leaf}-{index}", "leaf": leaf}))
     remaining = select_records(rows, {"a-0"}, per_leaf_limit=1)
     assert [record["id"] for _, record in remaining] == ["b-0"]
+
+
+def test_rag_staging_repairs_partial_files_and_skips_full_corpus(tmp_path: Path) -> None:
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    (source / "indexes").mkdir(parents=True)
+    (source / "quality_report.json").write_text("{}")
+    (source / "release_manifest.json").write_text("{}")
+    (source / "corpus_clean.jsonl").write_bytes(b"large corpus is not required by retrieval")
+    expected = {
+        "text.faiss": b"FAISS-CONTENT",
+        "text_metadata.jsonl": b'{"id":"one"}\n',
+        "text_manifest.json": b'{"count":1}',
+    }
+    for name, data in expected.items():
+        (source / "indexes" / name).write_bytes(data)
+    (destination / "indexes").mkdir(parents=True)
+    (destination / "indexes" / "text.faiss").write_bytes(b"partial")
+    staged = stage_corpus(source, destination)
+    for name, data in expected.items():
+        assert (staged / "indexes" / name).read_bytes() == data
+    assert not (staged / "corpus_clean.jsonl").exists()
 
 
 def test_permanent_http_400_is_not_retried(monkeypatch) -> None:
@@ -71,6 +130,39 @@ def test_permanent_http_400_is_not_retried(monkeypatch) -> None:
     else:
         raise AssertionError("Expected the permanent HTTP 400 to be surfaced")
     assert calls == 1
+
+
+def test_response_format_400_falls_back_once_without_consuming_retries(monkeypatch) -> None:
+    payloads = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"{\\"answer\\":1}"}}],"usage":{}}'
+
+    def respond(request, *args, **kwargs):
+        payloads.append(json.loads(request.data.decode("utf-8")))
+        if len(payloads) == 1:
+            raise urllib.error.HTTPError(
+                "https://openrouter.ai", 400, "Bad Request", {},
+                io.BytesIO(b'{"error":"response_format json_object is unsupported"}'),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr("urllib.request.urlopen", respond)
+    client = OpenRouterClient(api_key="test")
+    result = client.complete(
+        [{"role": "user", "content": "x"}],
+        OpenRouterConfig("test/model", retries=0),
+    )
+    assert result["choices"]
+    assert "response_format" in payloads[0]
+    assert "response_format" not in payloads[1]
 
 
 def test_agent_usage_is_counted_and_valid_response_is_cached(tmp_path: Path) -> None:

@@ -31,30 +31,55 @@ def notebook(cells: list[dict]) -> dict:
 
 COMMON_CONFIG = '''# Edit only this cell, then use Runtime -> Run all.
 REPO_URL = "https://github.com/asalmeskin/GeoMapBench.git"
-GIT_REF = "main"  # For a paper, replace with the final v1.7.0 tag or commit SHA.
+GIT_REF = "main"  # For the paper, replace with the final v1.7.1 tag or commit SHA.
 
-BENCHMARK_ROOT = "/content/drive/MyDrive/geomapbench_100"
+BENCHMARK_ROOT = "/content/drive/MyDrive/GeoMapBench_Data/geomapbench_100"
 RESULTS_ROOT = "/content/drive/MyDrive/geomapbench_results_final"
 
-# None = full 100/leaf. Use 1 for the mandatory 23-call pilot, then switch to None.
-PER_LEAF_LIMIT = None
+# Safe default: 1 = a 23-record pilot per model/condition. After it passes,
+# change this to None for the official full 23 x 100 evaluation.
+PER_LEAF_LIMIT = 1
 '''
 
 
 BOOTSTRAP = '''from google.colab import drive
 drive.mount("/content/drive")
 
-import getpass, os, shutil, subprocess
+import getpass, os, shlex, shutil, subprocess
 from pathlib import Path
 
 if not os.environ.get("OPENROUTER_API_KEY"):
     os.environ["OPENROUTER_API_KEY"] = getpass.getpass("OPENROUTER_API_KEY: ")
+os.environ["PYTHONUNBUFFERED"] = "1"
+os.environ["GEOMAPBENCH_IMAGE_CACHE"] = "/content/geomapbench_image_cache"
+
+def run_live(command, *, cwd=None):
+    """Stream combined stdout/stderr so Colab always shows live progress."""
+    command = [str(part) for part in command]
+    print("\\nRunning:", shlex.join(command), flush=True)
+    process = subprocess.Popen(
+        command,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=os.environ.copy(),
+    )
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="", flush=True)
+    return_code = process.wait()
+    if return_code:
+        raise RuntimeError(
+            f"Command failed with exit code {return_code}: {shlex.join(command)}"
+        )
 
 repo = Path("/content/GeoMapBench")
 if repo.exists():
     shutil.rmtree(repo)
-subprocess.run(["git", "clone", REPO_URL, str(repo)], check=True)
-subprocess.run(["git", "-C", str(repo), "checkout", GIT_REF], check=True)
+run_live(["git", "clone", REPO_URL, str(repo)])
+run_live(["git", "-C", str(repo), "checkout", GIT_REF])
 print("checked out:", subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip())
 '''
 
@@ -63,7 +88,7 @@ def build() -> None:
     simple = notebook([
         markdown("# GeoMapBench — simple eight-model evaluation\n\nThis notebook contains no evaluator logic. It mounts Drive, clones a frozen code release, validates the canonical 23 × 100 benchmark, runs the model suite, and displays the report. Rerun after a disconnect to resume completed IDs."),
         code(COMMON_CONFIG + '\nMAX_COST_USD_PER_MODEL = 25.0\n'),
-        code(BOOTSTRAP + '\nsubprocess.run(["python", "-m", "pip", "install", "-q", "-e", str(repo)], check=True)\n'),
+        code(BOOTSTRAP + '\nrun_live(["python", "-m", "pip", "install", "--disable-pip-version-check", "-e", str(repo)])\n'),
         code('''models = repo / "config/evaluation_models_2026-09.json"
 output = Path(RESULTS_ROOT) / ("model_suite_full" if PER_LEAF_LIMIT is None else f"model_suite_{PER_LEAF_LIMIT}_per_leaf")
 
@@ -76,7 +101,7 @@ command = [
 ]
 if PER_LEAF_LIMIT is not None:
     command += ["--per-leaf-limit", str(PER_LEAF_LIMIT)]
-subprocess.run(command, check=True)
+run_live(command)
 '''),
         code('''import pandas as pd
 report = pd.read_csv(output / "model_comparison.csv")
@@ -93,7 +118,7 @@ ANSWER_MODEL = "qwen/qwen3.8-flash"
 AGENT_MODEL = "google/gemini-3.5-flash-lite"
 MAX_COST_USD_PER_CONDITION = 25.0
 '''),
-        code(BOOTSTRAP + '\nsubprocess.run(["python", "-m", "pip", "install", "-q", "-e", f"{repo}[rag-index]"], check=True)\n'),
+        code(BOOTSTRAP + '\nrun_live(["python", "-m", "pip", "install", "--disable-pip-version-check", "-e", f"{repo}[rag-index]"])\n'),
         code('''output = Path(RESULTS_ROOT) / ("qwen38_rag_modes_full" if PER_LEAF_LIMIT is None else f"qwen38_rag_modes_{PER_LEAF_LIMIT}_per_leaf")
 command = [
     "geomapbench-eval", "rag-experiment",
@@ -107,7 +132,7 @@ command = [
 ]
 if PER_LEAF_LIMIT is not None:
     command += ["--per-leaf-limit", str(PER_LEAF_LIMIT)]
-subprocess.run(command, check=True)
+run_live(command)
 '''),
         code('''import json, pandas as pd
 summary = json.loads((output / "experiment_summary.json").read_text())

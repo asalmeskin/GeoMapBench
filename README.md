@@ -5,7 +5,7 @@ This package builds **exactly 100 deterministic examples for each of 23 leaves**
 
 ## September 2026 final evaluation release
 
-Release `1.7.0` keeps benchmark and corpus generation in the package and moves all
+Release `1.7.1` keeps benchmark and corpus generation in the package and moves all
 evaluation/RAG logic out of Colab. The two notebooks under `notebooks/` only mount
 Drive, clone a pinned repository revision, install the package, locate the requested
 data directories, and invoke versioned CLI commands.
@@ -302,6 +302,12 @@ geomapbench-data clean --root /path/to/geomapbench_100 --overwrite
 gold targets, source metadata, seeds, group IDs, or provenance to a model. It
 uses only the task input and the input assets, records raw model responses plus
 usage/latency, and scores locally. Keep your API key out of notebooks and Git:
+
+The evaluator rasterizes SVG and TIFF/GeoTIFF inputs to cached, browser-safe PNG
+payloads before API calls. SpaceNet-style high-dynamic-range rasters are converted
+to visible 8-bit RGB, and every direct image is signature-checked during the
+zero-cost preflight. CLI and notebook runs stream preflight, model/condition,
+record, error, and cost progress.
 
 ```bash
 # Zero-cost validation: must report valid=true, 23 leaves, 2300 records.

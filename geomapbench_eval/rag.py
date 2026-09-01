@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -17,12 +18,28 @@ BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 def stage_corpus(source: Path, destination: Path) -> Path:
     """Copy only retrieval-time corpus artifacts from slow mounted storage."""
-    source, destination = Path(source), Path(destination)
+    source, destination = Path(source).expanduser().resolve(), Path(destination).expanduser().resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"GeoMapRAG corpus root not found: {source}")
     destination.mkdir(parents=True, exist_ok=True)
-    for name in ("corpus_clean.jsonl", "corpus.jsonl", "quality_report.json", "release_manifest.json"):
+
+    def copy_verified(src: Path, dst: Path) -> None:
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+            print(f"[rag-stage] reuse {dst.name} ({dst.stat().st_size / 1_000_000:.1f} MB)", flush=True)
+            return
+        temporary = dst.with_name(f".{dst.name}.part")
+        print(f"[rag-stage] copy {src} -> {dst} ({src.stat().st_size / 1_000_000:.1f} MB)", flush=True)
+        shutil.copy2(src, temporary)
+        if temporary.stat().st_size != src.stat().st_size:
+            raise OSError(f"Incomplete staged copy: {src} -> {temporary}")
+        os.replace(temporary, dst)
+
+    # Dense retrieval reads text_metadata.jsonl directly; the full corpus JSONL
+    # is intentionally not copied into ephemeral Colab storage.
+    for name in ("quality_report.json", "release_manifest.json"):
         src = source / name
-        if src.exists() and not (destination / name).exists():
-            shutil.copy2(src, destination / name)
+        if src.exists():
+            copy_verified(src, destination / name)
     src_index, dst_index = source / "indexes", destination / "indexes"
     dst_index.mkdir(exist_ok=True)
     for name in ("text.faiss", "text_metadata.jsonl", "text_manifest.json"):
@@ -30,8 +47,8 @@ def stage_corpus(source: Path, destination: Path) -> Path:
         if not src.exists():
             raise FileNotFoundError(f"Missing required dense retrieval artifact: {src}")
         dst = dst_index / name
-        if not dst.exists() or src.stat().st_size != dst.stat().st_size:
-            shutil.copy2(src, dst)
+        copy_verified(src, dst)
+    print(f"[rag-stage] dense retrieval artifacts ready: {destination}", flush=True)
     return destination
 
 
@@ -50,6 +67,7 @@ class DenseRAGRetriever:
         from sentence_transformers import CrossEncoder, SentenceTransformer
 
         self.root = Path(corpus_root).expanduser().resolve()
+        print(f"[retriever] loading dense corpus/index from {self.root}", flush=True)
         index_dir = self.root / "indexes"
         manifest_path = index_dir / "text_manifest.json"
         metadata_path = index_dir / "text_metadata.jsonl"
@@ -63,8 +81,14 @@ class DenseRAGRetriever:
         if self.index.ntotal != len(self.records) or self.manifest.get("count") != len(self.records):
             raise ValueError("text.faiss, text_metadata.jsonl, and text_manifest.json disagree")
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        print(
+            f"[retriever] {len(self.records)} passages | embedding={self.manifest['model']} | "
+            f"reranker={reranker_model or 'none'} | device={self.device}",
+            flush=True,
+        )
         self.encoder = SentenceTransformer(str(self.manifest["model"]), device=self.device)
         self.reranker = CrossEncoder(reranker_model, device=self.device, max_length=512) if reranker_model else None
+        print("[retriever] models and FAISS index ready", flush=True)
         self.reranker_model = reranker_model
         self.candidate_k = candidate_k
         self.max_passage_chars = max_passage_chars

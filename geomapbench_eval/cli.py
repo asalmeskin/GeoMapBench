@@ -25,7 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "compare":
         print(json.dumps(compare(__import__("pathlib").Path(args.base_results), __import__("pathlib").Path(args.rag_results), __import__("pathlib").Path(args.output)), indent=2, sort_keys=True))
     elif args.command == "preflight":
-        print(json.dumps(benchmark_preflight(__import__("pathlib").Path(args.benchmark_root), encode_assets=not args.skip_assets), indent=2, sort_keys=True))
+        print(json.dumps(benchmark_preflight(
+            __import__("pathlib").Path(args.benchmark_root),
+            encode_assets=not args.skip_assets,
+            progress=True,
+        ), indent=2, sort_keys=True))
     elif args.command == "suite":
         print(json.dumps(run_model_suite(args), indent=2, sort_keys=True))
     else:
