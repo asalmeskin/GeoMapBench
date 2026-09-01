@@ -4,10 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geomapbench-data-kit"
-version = "1.5.0"
+version = "1.7.0"
 description = "Deterministic GeoMapBench builders plus a large resume-safe GeoMapRAG corpus pipeline"
 requires-python = ">=3.10"
 dependencies = [
+  "CairoSVG>=2.7,<3",
   "geopandas>=1.0,<2",
   "jsonschema>=4.22,<5",
   "matplotlib>=3.8,<4",

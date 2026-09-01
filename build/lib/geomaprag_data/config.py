@@ -1,0 +1,382 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class BuildProfile:
+    name: str
+    wikipedia_seed_count: int
+    wikipedia_pages_per_seed: int
+    wikipedia_target_chunks: int
+    wikidata_per_family: int
+    epsg_max_records: int
+    geonames_max_records: int
+    worldbank_years: tuple[int, ...]
+    wikimedia_seed_count: int
+    wikimedia_images_per_seed: int
+    osm_seed_count: int
+    osm_radius_m: int
+    osm_docs_per_region: int
+    osm_maps_per_region: int
+    osm_map_radius_m: int
+    osm_tile_offset_m: int
+
+
+PROFILES: dict[str, BuildProfile] = {
+    "smoke": BuildProfile(
+        name="smoke",
+        wikipedia_seed_count=5,
+        wikipedia_pages_per_seed=4,
+        wikipedia_target_chunks=80,
+        wikidata_per_family=20,
+        epsg_max_records=100,
+        geonames_max_records=100,
+        worldbank_years=(2020, 2023),
+        wikimedia_seed_count=2,
+        wikimedia_images_per_seed=1,
+        osm_seed_count=2,
+        osm_radius_m=1200,
+        osm_docs_per_region=30,
+        osm_maps_per_region=2,
+        osm_map_radius_m=500,
+        osm_tile_offset_m=450,
+    ),
+    "standard": BuildProfile(
+        name="standard",
+        wikipedia_seed_count=80,
+        wikipedia_pages_per_seed=18,
+        wikipedia_target_chunks=8_000,
+        wikidata_per_family=350,
+        epsg_max_records=3_000,
+        geonames_max_records=6_000,
+        worldbank_years=(2000, 2005, 2010, 2015, 2020, 2022, 2023, 2024),
+        wikimedia_seed_count=50,
+        wikimedia_images_per_seed=3,
+        osm_seed_count=80,
+        osm_radius_m=1600,
+        osm_docs_per_region=100,
+        osm_maps_per_region=4,
+        osm_map_radius_m=650,
+        osm_tile_offset_m=600,
+    ),
+    "publication": BuildProfile(
+        name="publication",
+        wikipedia_seed_count=186,
+        wikipedia_pages_per_seed=500,
+        wikipedia_target_chunks=10_000,
+        wikidata_per_family=3_000,
+        epsg_max_records=10_000,
+        geonames_max_records=50_000,
+        worldbank_years=(1995, 1996, 1997, 1998, 1999, 2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024),
+        wikimedia_seed_count=186,
+        wikimedia_images_per_seed=12,
+        osm_seed_count=186,
+        osm_radius_m=2200,
+        osm_docs_per_region=280,
+        osm_maps_per_region=9,
+        osm_map_radius_m=700,
+        osm_tile_offset_m=700,
+    ),
+}
+
+
+# Static, globally distributed seeds. They are deliberately fixed rather than
+# discovered from a live service so the spatial coverage of a paper release is
+# reproducible. The list is sorted deterministically before profile slicing.
+PLACES: tuple[tuple[str, str, float, float], ...] = (
+    ("Abidjan", "CI", 5.35995, -4.00826),
+    ("Abu Dhabi", "AE", 24.4539, 54.3773),
+    ("Accra", "GH", 5.6037, -0.1870),
+    ("Addis Ababa", "ET", 8.9806, 38.7578),
+    ("Adelaide", "AU", -34.9285, 138.6007),
+    ("Algiers", "DZ", 36.7538, 3.0588),
+    ("Amman", "JO", 31.9539, 35.9106),
+    ("Amsterdam", "NL", 52.3676, 4.9041),
+    ("Ankara", "TR", 39.9334, 32.8597),
+    ("Antananarivo", "MG", -18.8792, 47.5079),
+    ("Athens", "GR", 37.9838, 23.7275),
+    ("Atlanta", "US", 33.7490, -84.3880),
+    ("Auckland", "NZ", -36.8509, 174.7645),
+    ("Baghdad", "IQ", 33.3152, 44.3661),
+    ("Baku", "AZ", 40.4093, 49.8671),
+    ("Baltimore", "US", 39.2904, -76.6122),
+    ("Bamako", "ML", 12.6392, -8.0029),
+    ("Bangalore", "IN", 12.9716, 77.5946),
+    ("Bangkok", "TH", 13.7563, 100.5018),
+    ("Barcelona", "ES", 41.3874, 2.1686),
+    ("Beijing", "CN", 39.9042, 116.4074),
+    ("Beirut", "LB", 33.8938, 35.5018),
+    ("Belgrade", "RS", 44.7866, 20.4489),
+    ("Bergen", "NO", 60.3913, 5.3221),
+    ("Berlin", "DE", 52.5200, 13.4050),
+    ("Bern", "CH", 46.9480, 7.4474),
+    ("Bilbao", "ES", 43.2630, -2.9350),
+    ("Bogota", "CO", 4.7110, -74.0721),
+    ("Boston", "US", 42.3601, -71.0589),
+    ("Brasilia", "BR", -15.7939, -47.8828),
+    ("Bratislava", "SK", 48.1486, 17.1077),
+    ("Brisbane", "AU", -27.4698, 153.0251),
+    ("Brussels", "BE", 50.8503, 4.3517),
+    ("Bucharest", "RO", 44.4268, 26.1025),
+    ("Budapest", "HU", 47.4979, 19.0402),
+    ("Buenos Aires", "AR", -34.6037, -58.3816),
+    ("Cairo", "EG", 30.0444, 31.2357),
+    ("Calgary", "CA", 51.0447, -114.0719),
+    ("Cape Town", "ZA", -33.9249, 18.4241),
+    ("Caracas", "VE", 10.4806, -66.9036),
+    ("Casablanca", "MA", 33.5731, -7.5898),
+    ("Charlotte", "US", 35.2271, -80.8431),
+    ("Chicago", "US", 41.8781, -87.6298),
+    ("Chisinau", "MD", 47.0105, 28.8638),
+    ("Colombo", "LK", 6.9271, 79.8612),
+    ("Conakry", "GN", 9.6412, -13.5784),
+    ("Copenhagen", "DK", 55.6761, 12.5683),
+    ("Dakar", "SN", 14.7167, -17.4677),
+    ("Dallas", "US", 32.7767, -96.7970),
+    ("Dar es Salaam", "TZ", -6.7924, 39.2083),
+    ("Delhi", "IN", 28.6139, 77.2090),
+    ("Denver", "US", 39.7392, -104.9903),
+    ("Dhaka", "BD", 23.8103, 90.4125),
+    ("Doha", "QA", 25.2854, 51.5310),
+    ("Douala", "CM", 4.0511, 9.7679),
+    ("Dubai", "AE", 25.2048, 55.2708),
+    ("Dublin", "IE", 53.3498, -6.2603),
+    ("Durban", "ZA", -29.8587, 31.0218),
+    ("Edinburgh", "GB", 55.9533, -3.1883),
+    ("Edmonton", "CA", 53.5461, -113.4938),
+    ("Frankfurt", "DE", 50.1109, 8.6821),
+    ("Freetown", "SL", 8.4657, -13.2317),
+    ("Geneva", "CH", 46.2044, 6.1432),
+    ("Glasgow", "GB", 55.8642, -4.2518),
+    ("Guadalajara", "MX", 20.6597, -103.3496),
+    ("Guatemala City", "GT", 14.6349, -90.5069),
+    ("Guayaquil", "EC", -2.1709, -79.9224),
+    ("Hamburg", "DE", 53.5511, 9.9937),
+    ("Hanoi", "VN", 21.0278, 105.8342),
+    ("Harare", "ZW", -17.8252, 31.0335),
+    ("Havana", "CU", 23.1136, -82.3666),
+    ("Helsinki", "FI", 60.1699, 24.9384),
+    ("Ho Chi Minh City", "VN", 10.8231, 106.6297),
+    ("Hong Kong", "HK", 22.3193, 114.1694),
+    ("Honolulu", "US", 21.3069, -157.8583),
+    ("Houston", "US", 29.7604, -95.3698),
+    ("Hyderabad", "IN", 17.3850, 78.4867),
+    ("Islamabad", "PK", 33.6844, 73.0479),
+    ("Istanbul", "TR", 41.0082, 28.9784),
+    ("Jakarta", "ID", -6.2088, 106.8456),
+    ("Johannesburg", "ZA", -26.2041, 28.0473),
+    ("Kabul", "AF", 34.5553, 69.2075),
+    ("Kampala", "UG", 0.3476, 32.5825),
+    ("Karachi", "PK", 24.8607, 67.0011),
+    ("Kathmandu", "NP", 27.7172, 85.3240),
+    ("Khartoum", "SD", 15.5007, 32.5599),
+    ("Kigali", "RW", -1.9441, 30.0619),
+    ("Kingston", "JM", 17.9712, -76.7936),
+    ("Kinshasa", "CD", -4.4419, 15.2663),
+    ("Kuala Lumpur", "MY", 3.1390, 101.6869),
+    ("Kuwait City", "KW", 29.3759, 47.9774),
+    ("Kyiv", "UA", 50.4501, 30.5234),
+    ("La Paz", "BO", -16.4897, -68.1193),
+    ("Lagos", "NG", 6.5244, 3.3792),
+    ("Lahore", "PK", 31.5204, 74.3587),
+    ("Las Vegas", "US", 36.1699, -115.1398),
+    ("Lima", "PE", -12.0464, -77.0428),
+    ("Lisbon", "PT", 38.7223, -9.1393),
+    ("Ljubljana", "SI", 46.0569, 14.5058),
+    ("London", "GB", 51.5074, -0.1278),
+    ("Los Angeles", "US", 34.0522, -118.2437),
+    ("Luanda", "AO", -8.8390, 13.2894),
+    ("Lusaka", "ZM", -15.3875, 28.3228),
+    ("Luxembourg", "LU", 49.6116, 6.1319),
+    ("Lyon", "FR", 45.7640, 4.8357),
+    ("Madrid", "ES", 40.4168, -3.7038),
+    ("Managua", "NI", 12.1149, -86.2362),
+    ("Manila", "PH", 14.5995, 120.9842),
+    ("Maputo", "MZ", -25.9692, 32.5732),
+    ("Marrakesh", "MA", 31.6295, -7.9811),
+    ("Melbourne", "AU", -37.8136, 144.9631),
+    ("Mexico City", "MX", 19.4326, -99.1332),
+    ("Miami", "US", 25.7617, -80.1918),
+    ("Milan", "IT", 45.4642, 9.1900),
+    ("Minneapolis", "US", 44.9778, -93.2650),
+    ("Minsk", "BY", 53.9006, 27.5590),
+    ("Monrovia", "LR", 6.3156, -10.8074),
+    ("Montevideo", "UY", -34.9011, -56.1645),
+    ("Montreal", "CA", 45.5017, -73.5673),
+    ("Moscow", "RU", 55.7558, 37.6173),
+    ("Mumbai", "IN", 19.0760, 72.8777),
+    ("Munich", "DE", 48.1351, 11.5820),
+    ("Muscat", "OM", 23.5880, 58.3829),
+    ("Nairobi", "KE", -1.2921, 36.8219),
+    ("Naples", "IT", 40.8518, 14.2681),
+    ("New Orleans", "US", 29.9511, -90.0715),
+    ("New York", "US", 40.7128, -74.0060),
+    ("Nouakchott", "MR", 18.0735, -15.9582),
+    ("Osaka", "JP", 34.6937, 135.5023),
+    ("Oslo", "NO", 59.9139, 10.7522),
+    ("Ottawa", "CA", 45.4215, -75.6972),
+    ("Panama City", "PA", 8.9824, -79.5199),
+    ("Paris", "FR", 48.8566, 2.3522),
+    ("Perth", "AU", -31.9505, 115.8605),
+    ("Philadelphia", "US", 39.9526, -75.1652),
+    ("Phnom Penh", "KH", 11.5564, 104.9282),
+    ("Phoenix", "US", 33.4484, -112.0740),
+    ("Port Louis", "MU", -20.1609, 57.5012),
+    ("Port Moresby", "PG", -9.4438, 147.1803),
+    ("Portland", "US", 45.5152, -122.6784),
+    ("Prague", "CZ", 50.0755, 14.4378),
+    ("Quito", "EC", -0.1807, -78.4678),
+    ("Rabat", "MA", 34.0209, -6.8416),
+    ("Reykjavik", "IS", 64.1466, -21.9426),
+    ("Riga", "LV", 56.9496, 24.1052),
+    ("Rio de Janeiro", "BR", -22.9068, -43.1729),
+    ("Riyadh", "SA", 24.7136, 46.6753),
+    ("Rome", "IT", 41.9028, 12.4964),
+    ("Rotterdam", "NL", 51.9244, 4.4777),
+    ("San Diego", "US", 32.7157, -117.1611),
+    ("San Francisco", "US", 37.7749, -122.4194),
+    ("San Jose", "CR", 9.9281, -84.0907),
+    ("San Juan", "PR", 18.4655, -66.1057),
+    ("San Salvador", "SV", 13.6929, -89.2182),
+    ("Sana'a", "YE", 15.3694, 44.1910),
+    ("Santiago", "CL", -33.4489, -70.6693),
+    ("Santo Domingo", "DO", 18.4861, -69.9312),
+    ("Sao Paulo", "BR", -23.5505, -46.6333),
+    ("Seattle", "US", 47.6062, -122.3321),
+    ("Seoul", "KR", 37.5665, 126.9780),
+    ("Shanghai", "CN", 31.2304, 121.4737),
+    ("Singapore", "SG", 1.3521, 103.8198),
+    ("Sofia", "BG", 42.6977, 23.3219),
+    ("Stockholm", "SE", 59.3293, 18.0686),
+    ("Sydney", "AU", -33.8688, 151.2093),
+    ("Taipei", "TW", 25.0330, 121.5654),
+    ("Tallinn", "EE", 59.4370, 24.7536),
+    ("Tashkent", "UZ", 41.2995, 69.2401),
+    ("Tbilisi", "GE", 41.7151, 44.8271),
+    ("Tehran", "IR", 35.6892, 51.3890),
+    ("Tel Aviv", "IL", 32.0853, 34.7818),
+    ("Tokyo", "JP", 35.6762, 139.6503),
+    ("Toronto", "CA", 43.6532, -79.3832),
+    ("Tunis", "TN", 36.8065, 10.1815),
+    ("Ulaanbaatar", "MN", 47.8864, 106.9057),
+    ("Valencia", "ES", 39.4699, -0.3763),
+    ("Vancouver", "CA", 49.2827, -123.1207),
+    ("Vienna", "AT", 48.2082, 16.3738),
+    ("Vilnius", "LT", 54.6872, 25.2797),
+    ("Warsaw", "PL", 52.2297, 21.0122),
+    ("Washington", "US", 38.9072, -77.0369),
+    ("Wellington", "NZ", -41.2866, 174.7756),
+    ("Windhoek", "NA", -22.5609, 17.0658),
+    ("Yerevan", "AM", 40.1792, 44.4991),
+    ("Zagreb", "HR", 45.8150, 15.9819),
+    ("Zurich", "CH", 47.3769, 8.5417),
+)
+
+
+WIKIDATA_FAMILIES: dict[str, tuple[str, str]] = {
+    "mountains": ("Q8502", "mountain"),
+    "rivers": ("Q4022", "river"),
+    "lakes": ("Q23397", "lake"),
+    "seas": ("Q165", "sea"),
+    "islands": ("Q23442", "island"),
+    "cities": ("Q515", "city"),
+    "towns": ("Q3957", "town"),
+    "airports": ("Q1248784", "airport"),
+    "railway_stations": ("Q55488", "railway station"),
+    "bridges": ("Q12280", "bridge"),
+    "roads": ("Q34442", "road"),
+    "protected_areas": ("Q473972", "protected area"),
+    "volcanoes": ("Q8072", "volcano"),
+    "valleys": ("Q39816", "valley"),
+    "deserts": ("Q8514", "desert"),
+    "forests": ("Q4421", "forest"),
+    "glaciers": ("Q35666", "glacier"),
+    "waterfalls": ("Q34038", "waterfall"),
+    "peninsulas": ("Q34763", "peninsula"),
+    "bays": ("Q39594", "bay"),
+}
+
+
+
+GEONAMES_FEATURE_CLASSES: dict[str, str] = {
+    "A": "administrative feature",
+    "H": "hydrographic feature",
+    "L": "area feature",
+    "P": "populated place",
+    "R": "road or railroad feature",
+    "S": "spot or facility feature",
+    "T": "terrain feature",
+    "U": "undersea feature",
+    "V": "vegetation feature",
+}
+
+# Country dumps are much richer than cities500 because they cover all nine
+# GeoNames feature classes. These fixed countries provide broad continental
+# coverage without requiring the very large allCountries dump.
+GEONAMES_COUNTRIES: tuple[str, ...] = (
+    "AR", "AT", "AU", "BR", "CA", "CH", "CL", "CO", "CZ", "DE",
+    "EG", "ES", "FI", "FR", "GB", "GR", "ID", "IN", "IS", "IT",
+    "JP", "KE", "KR", "MA", "MX", "NP", "NO", "NZ", "PE", "PH",
+    "PL", "PT", "RO", "SE", "TH", "TR", "VN", "ZA",
+)
+
+WORLD_BANK_INDICATORS: dict[str, tuple[str, str]] = {
+    "EN.POP.DNST": ("population density", "people per sq. km of land area"),
+    "SP.POP.TOTL": ("population", "people"),
+    "SP.URB.TOTL.IN.ZS": ("urban population share", "percent of total population"),
+    "AG.LND.TOTL.K2": ("land area", "sq. km"),
+    "NY.GDP.PCAP.CD": ("GDP per capita", "current US dollars"),
+}
+
+
+CAPABILITY_HINTS: dict[str, tuple[str, ...]] = {
+    "Wikipedia": (
+        "geographic_fact_reasoning",
+        "toponym_recognition",
+        "geo_entity_typing",
+        "geologic_geomorphic_interpretation",
+    ),
+    "Wikidata": (
+        "geo_entity_typing",
+        "toponym_recognition",
+        "cross_entity_comparison",
+        "geographic_fact_reasoning",
+    ),
+    "GeoNames": (
+        "toponym_recognition",
+        "geo_entity_typing",
+        "geographic_fact_reasoning",
+    ),
+    "World Bank": (
+        "population_density_estimation",
+        "cross_entity_comparison",
+        "geographic_fact_reasoning",
+    ),
+    "EPSG / PROJ": (
+        "coordinate_transformation",
+        "metric_distance_computation",
+    ),
+    "Wikimedia Commons": (
+        "visual_geolocation",
+        "geographic_fact_reasoning",
+    ),
+    "OpenStreetMap": (
+        "map_label_feature_anchoring",
+        "metric_distance_computation",
+        "topological_directional_reasoning",
+        "spatial_graph_construction",
+        "shortest_path_optimization",
+        "isochrone_service_area",
+        "visual_geolocation",
+    ),
+}
+
+
+def select_places(count: int, seed: int = 1337) -> list[tuple[str, str, float, float]]:
+    """Deterministic globally mixed prefix; smaller profiles are prefixes of larger ones."""
+    import random
+
+    rows = list(PLACES)
+    random.Random(seed).shuffle(rows)
+    return rows[: min(int(count), len(rows))]

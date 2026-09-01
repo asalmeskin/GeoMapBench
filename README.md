@@ -3,9 +3,32 @@
 This package builds **exactly 100 deterministic examples for each of 23 leaves** in the revised GeoMapBench taxonomy. It does not bundle multi-gigabyte upstream imagery or silently relicense it. Instead, it supplies official source links, download helpers, fixed per-leaf seeds, source-specific samplers, public-API generators, cached raw responses, provenance, and validation.
 
 
+## September 2026 final evaluation release
+
+Release `1.7.0` keeps benchmark and corpus generation in the package and moves all
+evaluation/RAG logic out of Colab. The two notebooks under `notebooks/` only mount
+Drive, clone a pinned repository revision, install the package, locate the requested
+data directories, and invoke versioned CLI commands.
+
+Important release guarantees:
+
+- evaluation reads only the canonical names in `geomapbench_data.common.SEEDS`;
+  Drive copy folders such as `dense_land_cover_labeling (1)` are reported and ignored;
+- every official run fails before API calls unless it finds exactly 23 × 100 unique records;
+- SVG benchmark assets are rasterized to supported PNG payloads;
+- pilot subsets are frozen before completed IDs are filtered, so resume is stable;
+- permanent HTTP 4xx errors are not retried, while 408/409/429/5xx remain retryable;
+- `base_rag` is BGE dense retrieval plus a cross-encoder reranker;
+- `agentic_rag` adds cached LLM query planning and evidence judging over exactly
+  the same dense retriever. Neither RAG mode uses BM25;
+- retrieval traces and agent caches persist across Colab restarts; reported cost
+  covers answer, planner, and judge calls separately and in total.
+
+The frozen eight-model matrix is `config/evaluation_models_2026-09.json`.
+
 ## August 2026 Bloom-balanced benchmark overlay
 
-Release `1.4.0` retains the Bloom-balanced conversion and robust canonical-leaf validation from 1.3.x, and adds the large resume-safe GeoMapRAG corpus pipeline described below. It adds an optional deterministic Bloom-taxonomy conversion for an already-built 23-leaf benchmark. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
+Release `1.4.0` added the Bloom-balanced conversion and large resume-safe GeoMapRAG corpus pipeline. It keeps every leaf at exactly 100 examples, reuses the existing source records/assets, and balances each leaf across all defensible Bloom levels from the current annotations. Five-level leaves contain 20 examples per level; six-level leaves contain 17/17/17/17/16/16 examples.
 
 The conversion is intentionally lightweight: it rewrites only `data.jsonl` and `manifest.json`, preserves all original target fields, adds `target.bloom_answer`, and stores the original two metadata files under `.pre_bloom/`. It does not redownload OpenEarthMap, SpaceNet, MapText, or any other upstream source.
 
@@ -273,57 +296,38 @@ The benchmark cleaner lives in `geomapbench_data/clean_data.py` and is available
 geomapbench-data clean --root /path/to/geomapbench_100 --overwrite
 ```
 
-## Run GeoMapBench with OpenRouter
+## Final Colab and CLI runners
 
 `geomapbench_eval` is a resumable inference/evaluation harness. It never sends
 gold targets, source metadata, seeds, group IDs, or provenance to a model. It
 uses only the task input and the input assets, records raw model responses plus
 usage/latency, and scores locally. Keep your API key out of notebooks and Git:
 
-```powershell
-$env:OPENROUTER_API_KEY = "..."
-geomapbench-data validate --root C:\data\geomapbench_100 --require-all
-geomapbench-data bloom-audit --root C:\data\geomapbench_100
-geomapbench-data clean --root C:\data\geomapbench_100
+```bash
+# Zero-cost validation: must report valid=true, 23 leaves, 2300 records.
+geomapbench-eval preflight --benchmark-root /data/geomapbench_100
 
-# Start with a stratified 23-example pilot (one record per leaf).
-geomapbench-eval run `
-  --benchmark-root C:\data\geomapbench_100 `
-  --output results\qwen38_flash_base `
-  --model qwen/qwen3.8-flash `
-  --condition base --per-leaf-limit 1 --max-cost-usd 10
+# Eight-model simple evaluation. Add --per-leaf-limit 1 for a pilot.
+geomapbench-eval suite \
+  --benchmark-root /data/geomapbench_100 \
+  --models config/evaluation_models_2026-09.json \
+  --output /results/model_suite
 
-# Full run after inspecting the pilot.
-geomapbench-eval run `
-  --benchmark-root C:\data\geomapbench_100 `
-  --output results\qwen38_flash_base `
-  --model qwen/qwen3.8-flash --condition base
-
-# Deterministic lexical BM25 RAG baseline (requires an already validated corpus).
-geomapbench-eval run `
-  --benchmark-root C:\data\geomapbench_100 `
-  --corpus-root C:\data\GeoMapRAG_Corpus `
-  --output results\qwen38_flash_rag `
-  --model qwen/qwen3.8-flash --condition rag --top-k 5
-
-geomapbench-eval analyze `
-  --results results\qwen38_flash_base\responses.jsonl `
-  --output results\qwen38_flash_base\analysis
-
-# Paired comparison: only records completed in both conditions contribute.
-geomapbench-eval compare `
-  --base-results results\qwen38_flash_base\responses.jsonl `
-  --rag-results results\qwen38_flash_rag\responses.jsonl `
-  --output results\qwen38_flash_comparison
+# One-model paired Base, base_rag, and agentic_rag experiment (no BM25).
+geomapbench-eval rag-experiment \
+  --benchmark-root /data/geomapbench_100 \
+  --corpus-root /data/GeoMapRAG_Corpus \
+  --corpus-local-cache /tmp/geomaprag_corpus \
+  --model qwen/qwen3.8-flash \
+  --output /results/qwen38_rag_final
 ```
 
 The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf
-bar chart and Bloom-level plot when Matplotlib is installed (pass `--no-plots`
-for a table-only run). The RAG condition deliberately starts with an inspectable lexical retriever.
-It is a baseline, not a claim of multimodal retrieval: test its retrieved IDs
-and retrieval metrics before attributing answer changes to RAG. The command
-writes a per-leaf CSV, macro averages, Bloom-level summary, format-failure
-rate, bootstrap confidence intervals, latency, and OpenRouter-reported cost.
+bar chart and Bloom-level plot when Matplotlib is installed. The suite additionally
+writes `model_comparison.csv/json`. The RAG experiment writes all three paired
+comparisons, record-level and per-leaf deltas, bootstrap confidence intervals, and
+separate deltas for corpus-covered versus uncovered leaves. The retrieved corpus media are not passed to the answer model;
+this release is accurately described as dense text-evidence RAG over a multimodal corpus.
 
 For a paper release, create a separate output directory per model/condition,
 pin the exact model ID, store the API response metadata, and do not use
