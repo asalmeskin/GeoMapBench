@@ -14,7 +14,7 @@ from .prompts import (
 )
 
 
-PREFLIGHT_REVISION = "2026-09-cache-v3-portable-hash"
+PREFLIGHT_REVISION = "2026-09-cache-v4-protocol-190"
 
 
 def _sha256_file(path: Path) -> str:

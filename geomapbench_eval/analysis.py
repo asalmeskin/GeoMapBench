@@ -104,6 +104,12 @@ def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dic
                 float(item["score"]) for item in group if not item.get("artifact_target")
             ]), 4),
             "mean_latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3),
+            "agent_call_count": sum(int((item.get("retrieval_usage") or {}).get("calls") or 0) for item in group),
+            "agent_cached_call_count": sum(int((item.get("retrieval_usage") or {}).get("cached_calls") or 0) for item in group),
+            "agent_failure_count": sum(int((item.get("retrieval_usage") or {}).get("agent_failures") or 0) for item in group),
+            "records_with_agent_failure_rate": round(sum(
+                bool((item.get("retrieval_usage") or {}).get("agent_failures")) for item in group
+            ) / len(group), 4),
             "total_cost_usd": round(sum(
                 float((item.get("usage") or {}).get("cost") or 0)
                 + float((item.get("retrieval_usage") or {}).get("cost") or 0)
@@ -129,7 +135,7 @@ def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dic
 def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     """Compare two completed conditions by the same record IDs."""
     fairness_fields = (
-        "model", "temperature", "max_tokens", "reasoning_effort", "top_k",
+        "model", "temperature", "max_tokens", "reasoning_effort", "reasoning_enabled", "top_k",
         "include_images", "per_leaf_limit", "limit", "target_record_count",
         "selected_ids_hash", "selected_records_hash", "protocol",
         "benchmark_content_hash",

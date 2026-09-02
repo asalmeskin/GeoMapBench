@@ -1,19 +1,20 @@
 # GeoMapBench taxonomy data kit
 
-## Final evaluation workflow (v1.8.2)
+## Final evaluation workflow (v1.9.1)
 
 The final release includes two orchestration-only Colab notebooks:
 
-- `notebooks/GeoMapBench_Evaluation.ipynb`: an eight-model base benchmark suite.
+- `notebooks/GeoMapBench_Evaluation.ipynb`: six multimodal models from six independent companies.
 - `notebooks/GeoMapBench_RAG_Final.ipynb`: independent dense `base_rag` and dense `agentic_rag` runs for one answer model.
 
 The RAG pipeline is dense-only. It uses the corpus `text.faiss` index built with
 `BAAI/bge-small-en-v1.5`, optionally reranks candidates with
 `BAAI/bge-reranker-base`, and does not use BM25.
 
-Both suites default to an 8,192-token output budget. Reasoning effort is explicit
-per model, and response rows record `finish_reason`, reasoning-token usage, empty
-responses, and token-limit generation failures. The evaluator loads only the 23
+Both suites default to a 16,384-token output budget. Reasoning is disabled for
+models where the current catalog permits it and set to the minimum/low supported
+effort for mandatory-reasoning Gemini models. Response rows record `finish_reason`,
+reasoning-token usage, empty responses, and token-limit generation failures. The evaluator loads only the 23
 canonical benchmark leaves, chooses pilot subsets before resume filtering, and
 converts SVG/TIFF assets to supported PNG payloads inside the codebase.
 
@@ -23,7 +24,15 @@ JSONL files, referenced assets, prompt revision, and image converter revision ar
 unchanged. Use `--force-preflight` after changing benchmark data.
 
 Always run the 23-record pilot (`--per-leaf-limit 1`) before a full publication
-run. Do not proceed while any model has a nonzero `generation_failure_rate`.
+run, then a 115-record stability pilot (`--per-leaf-limit 5`). Do not proceed
+while any model has a nonzero `generation_failure_rate`.
+
+Every condition writes `run_state.json`, `inflight.json`, and a write-ahead
+`api_responses.jsonl` cache. A response received immediately before a runtime
+disconnect is recovered without another API call. Long exponential retry with
+jitter handles transient failures; persistent rate limits open a circuit breaker
+and pause the run so it can be resumed safely later. Partial runs are marked
+`complete=false` and are never promoted to final accuracy.
 
 The RAG notebook never launches a no-retrieval Base and has no dependency on an
 Evaluation output. Both notebooks load the same model matrix and save exact model
@@ -320,8 +329,8 @@ geomapbench-data clean --root C:\data\geomapbench_100
 # Base model-suite pilot (one canonical record per leaf).
 geomapbench-eval suite `
   --benchmark-root C:\data\geomapbench_100 `
-  --models config\evaluation_models_2026-09-v4.json `
-  --output results\model_suite_1_per_leaf_v4 `
+  --models config\evaluation_models_2026-09-v6.json `
+  --output results\model_suite_1_per_leaf_v6 `
   --preflight-cache cache\preflight `
   --per-leaf-limit 1
 
@@ -330,23 +339,23 @@ geomapbench-eval rag-suite `
   --benchmark-root C:\data\geomapbench_100 `
   --corpus-root C:\data\GeoMapRAG_Corpus `
   --work-root C:\temp\geomaprag `
-  --output results\rag_suite_1_per_leaf_v4 `
-  --models config\evaluation_models_2026-09-v4.json `
-  --model qwen/qwen3.8-flash `
-  --agent-cache cache\agent `
+  --output results\rag_suite_1_per_leaf_v6 `
+  --models config\evaluation_models_2026-09-v6.json `
+  --model mistralai/mistral-small-2603 `
+  --agent-cache cache\agent_v191 `
   --preflight-cache cache\preflight `
   --conditions base_rag,agentic_rag `
   --per-leaf-limit 1
 
 geomapbench-eval analyze `
-  --results results\model_suite_1_per_leaf_v4\qwen_qwen3.8-flash\responses.jsonl `
-  --output results\model_suite_1_per_leaf_v4\qwen_qwen3.8-flash\analysis
+  --results results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\responses.jsonl `
+  --output results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\analysis
 
 # Later, after transferring the independently completed folders to one machine:
 geomapbench-eval compare `
-  --base-results results\model_suite_1_per_leaf_v4\qwen_qwen3.8-flash\responses.jsonl `
-  --rag-results results\rag_suite_1_per_leaf_v4\agentic_rag\responses.jsonl `
-  --output results\qwen38_flash_comparison
+  --base-results results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\responses.jsonl `
+  --rag-results results\rag_suite_1_per_leaf_v6\agentic_rag\responses.jsonl `
+  --output results\mistral_small_agentic_comparison
 ```
 
 The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf

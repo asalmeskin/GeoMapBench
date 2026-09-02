@@ -9,12 +9,15 @@ from typing import Any
 import numpy as np
 
 from .common import append_jsonl, read_jsonl, stable_json
-from .openrouter import OpenRouterClient, OpenRouterConfig, response_text
+from .openrouter import (
+    OpenRouterClient, OpenRouterConfig, finish_reason, generation_failure, response_text,
+)
 
 
 TEXT_MODEL = "BAAI/bge-small-en-v1.5"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 RERANK_MODEL = "BAAI/bge-reranker-base"
+AGENT_PROTOCOL_REVISION = "2026-09-agent-json-v3-no-invalid-cache"
 
 
 def stage_corpus(source: Path, destination: Path) -> Path:
@@ -167,6 +170,7 @@ class AgenticRAGRetriever(DenseRAGRetriever):
         agent_model: str,
         agent_cache: Path,
         agent_max_tokens: int = 2048,
+        agent_reasoning_effort: str = "minimal",
         max_subqueries: int = 3,
         max_hops: int = 2,
         **kwargs: Any,
@@ -177,21 +181,36 @@ class AgenticRAGRetriever(DenseRAGRetriever):
         self.agent_cache.mkdir(parents=True, exist_ok=True)
         self.agent_config = OpenRouterConfig(
             agent_model, temperature=0.0, max_tokens=agent_max_tokens,
-            timeout_seconds=180, retries=4, reasoning_effort="minimal",
+            timeout_seconds=240, retries=6, reasoning_effort=agent_reasoning_effort,
+            reasoning_enabled=True, request_delay_seconds=1.0,
         )
         self.agent_client = OpenRouterClient()
         self.max_subqueries = max_subqueries
         self.max_hops = max_hops
-        self._query_usage = {"cost": 0.0, "calls": 0, "cached_calls": 0}
+        self._query_usage = {
+            "cost": 0.0, "calls": 0, "cached_calls": 0,
+            "agent_failures": 0, "failure_kinds": [],
+        }
 
     def _agent(self, system: str, user: str, tag: str) -> dict[str, Any]:
         key = hashlib.sha256(
-            stable_json({"model": self.agent_model, "tag": tag, "system": system, "user": user}).encode()
+            stable_json({
+                "revision": AGENT_PROTOCOL_REVISION,
+                "model": self.agent_model,
+                "max_tokens": self.agent_config.max_tokens,
+                "reasoning_enabled": self.agent_config.reasoning_enabled,
+                "reasoning_effort": self.agent_config.reasoning_effort,
+                "tag": tag,
+                "system": system,
+                "user": user,
+            }).encode()
         ).hexdigest()
         path = self.agent_cache / f"{key}.json"
         if path.exists():
-            self._query_usage["cached_calls"] += 1
-            return json.loads(path.read_text(encoding="utf-8"))
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if cached.get("status") == "ok" and isinstance(cached.get("value"), dict):
+                self._query_usage["cached_calls"] += 1
+                return dict(cached["value"])
         response = self.agent_client.complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             self.agent_config,
@@ -200,19 +219,40 @@ class AgenticRAGRetriever(DenseRAGRetriever):
         self._query_usage["calls"] += 1
         self._query_usage["cost"] += float(usage.get("cost") or 0.0)
         raw = response_text(response)
+        failure = generation_failure(response, raw)
         try:
             value = json.loads(raw)
             if not isinstance(value, dict):
-                value = {"_error": "agent_non_object"}
+                failure = failure or "agent_non_object"
         except json.JSONDecodeError:
-            value = {"_error": "agent_invalid_json"}
+            value = {}
+            failure = failure or "agent_invalid_json"
+        if failure:
+            self._query_usage["agent_failures"] += 1
+            self._query_usage["failure_kinds"].append({
+                "tag": tag,
+                "kind": failure,
+                "finish_reason": finish_reason(response),
+            })
+            print(
+                f"[rag:agent-warning] {tag} failed ({failure}); using deterministic dense fallback",
+                flush=True,
+            )
+            return {"_error": failure}
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        temporary.write_text(json.dumps({
+            "status": "ok",
+            "revision": AGENT_PROTOCOL_REVISION,
+            "value": value,
+        }, ensure_ascii=False), encoding="utf-8")
         temporary.replace(path)
         return value
 
     def search(self, query: str, leaf: str, top_k: int) -> list[dict[str, Any]]:
-        self._query_usage = {"cost": 0.0, "calls": 0, "cached_calls": 0}
+        self._query_usage = {
+            "cost": 0.0, "calls": 0, "cached_calls": 0,
+            "agent_failures": 0, "failure_kinds": [],
+        }
         plan_system = (
             "Plan dense retrieval for a geospatial question. Return JSON only as "
             '{"queries":["..."]}. Produce at most '

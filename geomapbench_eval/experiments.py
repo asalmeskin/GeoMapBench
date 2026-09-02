@@ -44,7 +44,9 @@ def _run_namespace(
     model: str,
     condition: str,
     max_tokens: int,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
+    reasoning_enabled: bool,
+    temperature: float | None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         benchmark_root=args.benchmark_root,
@@ -52,11 +54,16 @@ def _run_namespace(
         model=model,
         condition=condition,
         top_k=getattr(args, "top_k", 5),
-        temperature=0.0,
+        temperature=temperature,
         max_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
-        timeout_seconds=180,
-        retries=4,
+        reasoning_enabled=reasoning_enabled,
+        timeout_seconds=args.timeout_seconds,
+        retries=args.retries,
+        request_delay_seconds=args.request_delay_seconds,
+        retry_base_seconds=args.retry_base_seconds,
+        retry_max_seconds=args.retry_max_seconds,
+        max_consecutive_errors=args.max_consecutive_errors,
         max_image_bytes=8_000_000,
         max_cost_usd=getattr(args, "max_cost_usd_per_model", None),
         limit=None,
@@ -77,15 +84,42 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
-def _catalog_check(model_rows: list[dict[str, Any]]) -> list[str]:
+def _catalog_check(model_rows: list[dict[str, Any]]) -> dict[str, str]:
     print("[suite] checking current OpenRouter model IDs", flush=True)
-    catalog = OpenRouterClient().model_catalog()
-    missing = [str(row["model"]) for row in model_rows if str(row["model"]) not in catalog]
-    if missing:
-        print(f"[suite:warning] unavailable model IDs will be skipped: {missing}", flush=True)
+    try:
+        catalog = OpenRouterClient().model_catalog()
+    except Exception as error:
+        print(
+            f"[suite:warning] live catalog check unavailable ({error!r}); "
+            "continuing with the frozen, previously validated model matrix",
+            flush=True,
+        )
+        return {}
+    problems: dict[str, str] = {}
+    for row in model_rows:
+        model = str(row["model"])
+        card = catalog.get(model)
+        if not card:
+            problems[model] = "model_unavailable_in_catalog"
+            continue
+        modalities = set((card.get("architecture") or {}).get("input_modalities") or [])
+        parameters = set(card.get("supported_parameters") or [])
+        if "image" not in modalities:
+            problems[model] = "model_catalog_does_not_advertise_image_input"
+        elif "response_format" not in parameters:
+            problems[model] = "model_catalog_does_not_advertise_response_format"
+        reasoning = card.get("reasoning") or {}
+        if reasoning.get("mandatory") and not bool(row.get("reasoning_enabled")):
+            problems[model] = "catalog_requires_reasoning_but_config_disables_it"
+        configured_effort = row.get("reasoning_effort")
+        supported_efforts = set(reasoning.get("supported_efforts") or [])
+        if configured_effort and supported_efforts and configured_effort not in supported_efforts:
+            problems[model] = f"unsupported_reasoning_effort:{configured_effort}"
+    if problems:
+        print(f"[suite:warning] catalog validation skips: {problems}", flush=True)
     else:
         print("[suite] model preflight PASS", flush=True)
-    return missing
+    return problems
 
 
 def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
@@ -99,9 +133,9 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
     reports: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     if not args.skip_model_preflight:
-        missing = set(_catalog_check(model_rows))
-        failures.extend({"model": model, "error": "model_unavailable_in_catalog"} for model in sorted(missing))
-        model_rows = [row for row in model_rows if str(row["model"]) not in missing]
+        problems = _catalog_check(model_rows)
+        failures.extend({"model": model, "error": error} for model, error in sorted(problems.items()))
+        model_rows = [row for row in model_rows if str(row["model"]) not in problems]
     for index, model_row in enumerate(model_rows, 1):
         model = str(model_row["model"])
         print(f"[suite {index}/{len(model_rows)}] START {model}", flush=True)
@@ -113,18 +147,25 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 model=model,
                 condition="base",
                 max_tokens=int(model_row.get("max_tokens", args.max_tokens)),
-                reasoning_effort=str(model_row.get("reasoning_effort", "minimal")),
+                reasoning_effort=model_row.get("reasoning_effort"),
+                reasoning_enabled=bool(model_row.get("reasoning_enabled", False)),
+                temperature=model_row.get("temperature", 0.0),
             )
             invocation = run(namespace)
             summary = analyze(model_output / "responses.jsonl", model_output / "analysis")
             condition = summary["condition_summary"].get("base", {})
             macro = summary["macro_by_condition"].get("base", 0.0)
+            complete = bool(invocation.get("complete"))
             report = {
                 "model": model,
                 "family": model_row.get("family"),
+                "tier": model_row.get("tier"),
                 "open_weights": bool(model_row.get("open_weights")),
                 "n": condition.get("n", 0),
-                "macro_accuracy": macro,
+                "target_n": invocation.get("target_records"),
+                "complete": complete,
+                "macro_accuracy": macro if complete else None,
+                "provisional_macro_accuracy": macro,
                 "text_answer_macro_accuracy": summary["text_answer_macro_by_condition"].get("base", 0.0),
                 "micro_accuracy": condition.get("micro_accuracy", 0.0),
                 "text_answer_micro_accuracy": condition.get("text_answer_micro_accuracy", 0.0),
@@ -132,24 +173,30 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 "invalid_json_rate": condition.get("invalid_json_rate", 0.0),
                 "generation_failure_rate": condition.get("generation_failure_rate", 0.0),
                 "mean_latency_seconds": condition.get("mean_latency_seconds", 0.0),
-                "reported_cost_usd": condition.get("total_cost_usd", 0.0),
+                "reported_cost_usd": invocation.get(
+                    "reported_cost_usd_total", condition.get("total_cost_usd", 0.0)
+                ),
                 "run_stop_reason": invocation.get("run_stop_reason"),
             }
-            if not report["n"]:
-                raise RuntimeError(f"{model} produced no successful records")
             reports.append(report)
             print(
-                f"[suite {index}/{len(model_rows)}] DONE {model}: n={report['n']} "
-                f"macro={report['macro_accuracy']} invalid={report['invalid_json_rate']} "
+                f"[suite {index}/{len(model_rows)}] {'DONE' if complete else 'PAUSED'} {model}: "
+                f"n={report['n']}/{report['target_n']} macro={report['provisional_macro_accuracy']} "
+                f"invalid={report['invalid_json_rate']} "
                 f"generation_fail={report['generation_failure_rate']} ${report['reported_cost_usd']:.4f}",
                 flush=True,
             )
         except Exception as error:
             failures.append({"model": model, "error": repr(error)})
             print(f"[suite {index}/{len(model_rows)}] FAILED {model}: {error!r}", flush=True)
-    reports.sort(key=lambda row: (-float(row["macro_accuracy"]), float(row["reported_cost_usd"])))
+    reports.sort(key=lambda row: (
+        not bool(row["complete"]),
+        -float(row["provisional_macro_accuracy"]),
+        float(row["reported_cost_usd"]),
+    ))
     fieldnames = [
-        "model", "family", "open_weights", "n", "macro_accuracy", "text_answer_macro_accuracy",
+        "model", "family", "tier", "open_weights", "n", "target_n", "complete",
+        "macro_accuracy", "provisional_macro_accuracy", "text_answer_macro_accuracy",
         "micro_accuracy", "text_answer_micro_accuracy", "artifact_target_rate",
         "invalid_json_rate", "generation_failure_rate", "mean_latency_seconds",
         "reported_cost_usd", "run_stop_reason",
@@ -172,8 +219,14 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
     if not requested or set(requested) - allowed:
         raise ValueError(f"--conditions must be a comma-separated subset of {sorted(allowed)}")
     model_row = _model_row(Path(args.models), args.model)
-    max_tokens = int(model_row.get("max_tokens", 8192))
-    reasoning_effort = str(model_row.get("reasoning_effort", "minimal"))
+    agent_row = _model_row(Path(args.models), args.agent_model)
+    catalog_problems = _catalog_check([model_row, agent_row])
+    if catalog_problems:
+        raise ValueError(f"RAG model catalog validation failed: {catalog_problems}")
+    max_tokens = int(model_row.get("max_tokens", 16384))
+    reasoning_effort = model_row.get("reasoning_effort")
+    reasoning_enabled = bool(model_row.get("reasoning_enabled", False))
+    temperature = model_row.get("temperature", 0.0)
     preflight = _preflight(args)
     args.benchmark_content_hash = preflight["portable_benchmark_hash"]
     local_corpus = stage_corpus(Path(args.corpus_root), Path(args.work_root) / "corpus")
@@ -183,6 +236,7 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
         namespace = _run_namespace(
             args, output=run_output, model=args.model, condition=condition,
             max_tokens=max_tokens, reasoning_effort=reasoning_effort,
+            reasoning_enabled=reasoning_enabled, temperature=temperature,
         )
         retriever = None
         if condition == "base_rag":
@@ -201,6 +255,7 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
                 agent_model=args.agent_model,
                 agent_cache=Path(args.agent_cache).expanduser(),
                 agent_max_tokens=args.agent_max_tokens,
+                agent_reasoning_effort=args.agent_reasoning_effort,
                 max_subqueries=args.agent_subqueries,
                 max_hops=args.agent_max_hops,
             )
@@ -213,7 +268,9 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[rag-suite] DONE {condition}", flush=True)
         del retriever
     comparisons: dict[str, Any] = {}
-    if {"base_rag", "agentic_rag"}.issubset(requested):
+    if {"base_rag", "agentic_rag"}.issubset(requested) and all(
+        bool(reports[item]["run"].get("complete")) for item in ("base_rag", "agentic_rag")
+    ):
         try:
             comparisons["base_rag_to_agentic_rag"] = compare(
                 output / "base_rag" / "responses.jsonl",
@@ -226,6 +283,11 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
                 "reason": str(error),
             }
             print(f"[rag-suite] comparison deferred: {error}", flush=True)
+    elif {"base_rag", "agentic_rag"}.issubset(requested):
+        comparisons["base_rag_to_agentic_rag"] = {
+            "protocol_validation": "deferred",
+            "reason": "Both conditions must reach their exact target record count; rerun the same cell to resume.",
+        }
     result = {
         "preflight": preflight,
         "model_config": model_row,
@@ -245,9 +307,15 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     suite.add_argument("--force-preflight", action="store_true")
     suite.add_argument("--skip-model-preflight", action="store_true")
     suite.add_argument("--per-leaf-limit", type=int)
-    suite.add_argument("--max-tokens", type=int, default=8192)
-    suite.add_argument("--max-cost-usd-per-model", type=float, default=25.0)
+    suite.add_argument("--max-tokens", type=int, default=16384)
+    suite.add_argument("--max-cost-usd-per-model", type=float, default=50.0)
     suite.add_argument("--progress-every", type=int, default=5)
+    suite.add_argument("--timeout-seconds", type=int, default=240)
+    suite.add_argument("--retries", type=int, default=6)
+    suite.add_argument("--request-delay-seconds", type=float, default=1.0)
+    suite.add_argument("--retry-base-seconds", type=float, default=5.0)
+    suite.add_argument("--retry-max-seconds", type=float, default=60.0)
+    suite.add_argument("--max-consecutive-errors", type=int, default=2)
 
     rag = sub.add_parser("rag-suite", help="Run dense base_rag and agentic_rag independently; comparisons are protocol-locked later.")
     rag.add_argument("--benchmark-root", required=True)
@@ -262,6 +330,12 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     rag.add_argument("--per-leaf-limit", type=int)
     rag.add_argument("--max-cost-usd-per-model", type=float, default=25.0)
     rag.add_argument("--progress-every", type=int, default=5)
+    rag.add_argument("--timeout-seconds", type=int, default=240)
+    rag.add_argument("--retries", type=int, default=6)
+    rag.add_argument("--request-delay-seconds", type=float, default=1.0)
+    rag.add_argument("--retry-base-seconds", type=float, default=5.0)
+    rag.add_argument("--retry-max-seconds", type=float, default=60.0)
+    rag.add_argument("--max-consecutive-errors", type=int, default=2)
     rag.add_argument("--top-k", type=int, default=5)
     rag.add_argument("--candidate-k", type=int, default=40)
     rag.add_argument("--max-passage-chars", type=int, default=1500)
@@ -270,5 +344,6 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     rag.add_argument("--agent-model", default="google/gemini-3.5-flash-lite")
     rag.add_argument("--agent-cache", required=True)
     rag.add_argument("--agent-max-tokens", type=int, default=2048)
+    rag.add_argument("--agent-reasoning-effort", default="minimal")
     rag.add_argument("--agent-subqueries", type=int, default=3)
     rag.add_argument("--agent-max-hops", type=int, default=2)

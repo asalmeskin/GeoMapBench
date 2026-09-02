@@ -9,7 +9,7 @@ from .prompts import IMAGE_CONVERTER_REVISION, PROMPT_REVISION
 from .scoring import SCORING_REVISION
 
 
-EVALUATION_PROTOCOL_REVISION = "2026-09-independent-runs-v2"
+EVALUATION_PROTOCOL_REVISION = "2026-09-resumable-inflight-v3"
 
 
 def protocol_descriptor() -> dict[str, Any]:
