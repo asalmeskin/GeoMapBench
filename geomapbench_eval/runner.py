@@ -72,7 +72,26 @@ def _row_cost(row: dict[str, Any]) -> float:
 def experiment_identity(args: argparse.Namespace) -> dict[str, Any]:
     benchmark_root = Path(args.benchmark_root).expanduser().resolve()
     records = canonical_benchmark_records(benchmark_root, prefer_clean=not args.no_clean)
-    selected = stable_subset(records, per_leaf_limit=args.per_leaf_limit, limit=args.limit)
+    record_ids_file = getattr(args, "record_ids_file", None)
+    if record_ids_file:
+        payload = json.loads(Path(record_ids_file).expanduser().read_text(encoding="utf-8"))
+        requested = payload.get("selected_ids") if isinstance(payload, dict) else payload
+        if not isinstance(requested, list) or not requested:
+            raise ValueError(f"record ID file has no selected_ids: {record_ids_file}")
+        requested_ids = [str(value) for value in requested]
+        if len(requested_ids) != len(set(requested_ids)):
+            raise ValueError(f"record ID file contains duplicates: {record_ids_file}")
+        by_id = {str(record.get("id")): (directory, record) for directory, record in records}
+        missing = [record_id for record_id in requested_ids if record_id not in by_id]
+        if missing:
+            raise ValueError(f"record ID file contains unknown IDs: {missing[:10]}")
+        selected = [by_id[record_id] for record_id in requested_ids]
+    else:
+        selected = stable_subset(
+            records,
+            per_leaf_limit=getattr(args, "per_leaf_limit", None),
+            limit=getattr(args, "limit", None),
+        )
     ids = [str(record.get("id")) for _, record in selected]
     return {
         "benchmark_root": str(benchmark_root),
@@ -146,7 +165,7 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
     )
     identity = experiment_identity(args)
     run_config = {
-        "format": "GeoMapBench OpenRouter evaluation v5",
+        "format": "GeoMapBench OpenRouter cumulative evaluation v7",
         "created_at": utc_now(),
         "model": args.model,
         "condition": condition,
@@ -157,18 +176,31 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
         "benchmark_root": str(benchmark_root),
         "top_k": args.top_k,
         "include_images": not args.no_images,
-        "per_leaf_limit": args.per_leaf_limit,
-        "limit": args.limit,
+        "per_leaf_limit": getattr(args, "per_leaf_limit", None),
+        "limit": getattr(args, "limit", None),
+        "record_ids_file": str(getattr(args, "record_ids_file", None) or ""),
+        "cumulative": bool(getattr(args, "cumulative", False)),
         "target_record_count": identity["target_record_count"],
         "selected_ids_hash": identity["selected_ids_hash"],
         "selected_records_hash": identity["selected_records_hash"],
+        "selected_ids": identity["selected_ids"],
         "protocol": protocol_descriptor(),
         "benchmark_content_hash": getattr(args, "benchmark_content_hash", None),
     }
     config_path = output_root / "run_config.json"
     if config_path.exists() and not args.force:
         previous = json.loads(config_path.read_text(encoding="utf-8"))
-        comparable = set(run_config) - {"created_at"}
+        if run_config["cumulative"] and previous.get("cumulative"):
+            old_ids = set(previous.get("selected_ids") or [])
+            if not old_ids.issubset(identity["selected_ids"]):
+                raise ValueError("Cumulative output cannot shrink or replace previously selected IDs")
+            comparable = {
+                "model", "condition", "temperature", "max_tokens",
+                "reasoning_effort", "reasoning_enabled", "benchmark_root", "top_k",
+                "include_images", "protocol", "benchmark_content_hash", "cumulative",
+            }
+        else:
+            comparable = set(run_config) - {"created_at"}
         changed = [key for key in comparable if previous.get(key) != run_config.get(key)]
         if changed:
             raise ValueError(
@@ -179,17 +211,25 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
 
     experiment = identity["records"]
     prior_rows = _rows(result_path)
-    done_rows = {} if args.force else completed_rows(result_path)
+    target_ids = set(identity["selected_ids"])
+    done_rows = {} if args.force else {
+        record_id: row for record_id, row in completed_rows(result_path).items()
+        if record_id in target_ids
+    }
     selected = [item for item in experiment if str(item[1].get("id")) not in done_rows]
     api_cache = _cached_api_responses(api_cache_path)
-    existing_cost = sum(
+    existing_answer_cost = sum(
         float(((row.get("response") or {}).get("usage") or {}).get("cost") or 0.0)
-        + float((row.get("retrieval_usage") or {}).get("cost") or 0.0)
+        for row in api_cache.values()
+    )
+    existing_retrieval_cost = sum(
+        float((row.get("retrieval_usage") or {}).get("cost") or 0.0)
         for row in api_cache.values()
     ) + sum(
         float((row.get("retrieval_usage") or {}).get("cost") or 0.0)
         for row in prior_rows if row.get("status") == "error"
     )
+    existing_cost = existing_answer_cost + existing_retrieval_cost
     print(
         f"[run] model={args.model} condition={condition} | target={len(experiment)} "
         f"completed={len(done_rows)} remaining={len(selected)} | cached_api={len(api_cache)} "
@@ -205,6 +245,8 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
             "succeeded": 0,
             "failed": 0,
             "reported_cost_usd_this_invocation": 0.0,
+            "answer_cost_usd_total": round(existing_answer_cost, 8),
+            "agent_cost_usd_total": round(existing_retrieval_cost, 8),
             "reported_cost_usd_total": round(existing_cost, 8),
             "run_stop_reason": "already_complete",
             "complete": True,
@@ -406,7 +448,10 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
         if stop_reason:
             break
 
-    final_completed = completed_rows(result_path)
+    final_completed = {
+        record_id: row for record_id, row in completed_rows(result_path).items()
+        if record_id in target_ids
+    }
     complete = len(final_completed) == len(experiment)
     if stop_reason is None:
         stop_reason = "completed" if complete else "incomplete_errors"
@@ -426,6 +471,8 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
         "answer_cost_usd_this_invocation": round(answer_cost, 8),
         "retrieval_cost_usd_this_invocation": round(retrieval_cost, 8),
         "reported_cost_usd_this_invocation": round(answer_cost + retrieval_cost, 8),
+        "answer_cost_usd_total": round(existing_answer_cost + answer_cost, 8),
+        "agent_cost_usd_total": round(existing_retrieval_cost + retrieval_cost, 8),
         "reported_cost_usd_total": round(total_spent, 8),
         "run_stop_reason": stop_reason,
         "complete": complete,
@@ -466,6 +513,8 @@ def add_run_parser(sub: argparse._SubParsersAction[Any]) -> None:
     parser.add_argument("--max-cost-usd", type=float)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--per-leaf-limit", type=int)
+    parser.add_argument("--record-ids-file")
+    parser.add_argument("--cumulative", action="store_true")
     parser.add_argument("--progress-every", type=int, default=5)
     parser.add_argument("--no-images", action="store_true")
     parser.add_argument("--no-clean", action="store_true")

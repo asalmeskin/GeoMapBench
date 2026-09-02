@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from .common import append_jsonl, read_jsonl, stable_json
+from .common import append_jsonl, atomic_json, read_jsonl, stable_json
 from .openrouter import (
     OpenRouterClient, OpenRouterConfig, finish_reason, generation_failure, response_text,
 )
@@ -17,7 +17,7 @@ from .openrouter import (
 TEXT_MODEL = "BAAI/bge-small-en-v1.5"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 RERANK_MODEL = "BAAI/bge-reranker-base"
-AGENT_PROTOCOL_REVISION = "2026-09-agent-json-v3-no-invalid-cache"
+AGENT_PROTOCOL_REVISION = "2026-09-agent-json-v4-write-ahead"
 
 
 def stage_corpus(source: Path, destination: Path) -> Path:
@@ -206,18 +206,37 @@ class AgenticRAGRetriever(DenseRAGRetriever):
             }).encode()
         ).hexdigest()
         path = self.agent_cache / f"{key}.json"
+        response_path = self.agent_cache / f"{key}.response.json"
         if path.exists():
             cached = json.loads(path.read_text(encoding="utf-8"))
             if cached.get("status") == "ok" and isinstance(cached.get("value"), dict):
                 self._query_usage["cached_calls"] += 1
                 return dict(cached["value"])
-        response = self.agent_client.complete(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            self.agent_config,
-        )
+        recovered_response = False
+        if response_path.exists():
+            payload = json.loads(response_path.read_text(encoding="utf-8"))
+            response = payload.get("response") if isinstance(payload, dict) else None
+            if not isinstance(response, dict):
+                response_path.unlink(missing_ok=True)
+                response = None
+            else:
+                recovered_response = True
+                self._query_usage["cached_calls"] += 1
+                print(f"[rag:agent-cache-hit] recovered {tag} response", flush=True)
+        else:
+            response = None
+        if response is None:
+            response = self.agent_client.complete(
+                [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                self.agent_config,
+            )
+            # Write the raw response before parsing so a runtime interruption cannot
+            # turn a paid planner/judge response into a duplicate request.
+            atomic_json(response_path, {"status": "received", "response": response})
+            self._query_usage["calls"] += 1
         usage = response.get("usage") or {}
-        self._query_usage["calls"] += 1
-        self._query_usage["cost"] += float(usage.get("cost") or 0.0)
+        if not recovered_response:
+            self._query_usage["cost"] += float(usage.get("cost") or 0.0)
         raw = response_text(response)
         failure = generation_failure(response, raw)
         try:
@@ -228,6 +247,7 @@ class AgenticRAGRetriever(DenseRAGRetriever):
             value = {}
             failure = failure or "agent_invalid_json"
         if failure:
+            response_path.unlink(missing_ok=True)
             self._query_usage["agent_failures"] += 1
             self._query_usage["failure_kinds"].append({
                 "tag": tag,
@@ -239,13 +259,12 @@ class AgenticRAGRetriever(DenseRAGRetriever):
                 flush=True,
             )
             return {"_error": failure}
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps({
+        atomic_json(path, {
             "status": "ok",
             "revision": AGENT_PROTOCOL_REVISION,
             "value": value,
-        }, ensure_ascii=False), encoding="utf-8")
-        temporary.replace(path)
+        })
+        response_path.unlink(missing_ok=True)
         return value
 
     def search(self, query: str, leaf: str, top_k: int) -> list[dict[str, Any]]:

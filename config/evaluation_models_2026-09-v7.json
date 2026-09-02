@@ -27,8 +27,7 @@
     "reasoning_enabled": false,
     "reasoning_effort": null,
     "temperature": 0.0,
-    "max_tokens": 16384,
-    "recommended_for_rag": true
+    "max_tokens": 16384
   },
   {
     "model": "qwen/qwen3.8-27b",
@@ -41,23 +40,14 @@
     "max_tokens": 16384
   },
   {
-    "model": "meta/muse-spark-1.2",
-    "family": "Meta",
-    "tier": "strong-multimodal",
-    "open_weights": false,
-    "reasoning_enabled": true,
-    "reasoning_effort": "minimal",
-    "temperature": 0.0,
-    "max_tokens": 16384
-  },
-  {
     "model": "anthropic/claude-sonnet-5",
     "family": "Claude",
-    "tier": "premium-reference",
+    "tier": "premium-reference-rag",
     "open_weights": false,
     "reasoning_enabled": false,
     "reasoning_effort": null,
     "temperature": null,
-    "max_tokens": 16384
+    "max_tokens": 16384,
+    "recommended_for_rag": true
   }
 ]

@@ -1,11 +1,11 @@
 # GeoMapBench taxonomy data kit
 
-## Final evaluation workflow (v1.9.1)
+## Final cumulative evaluation workflow (v2.0.0)
 
 The final release includes two orchestration-only Colab notebooks:
 
-- `notebooks/GeoMapBench_Evaluation.ipynb`: six multimodal models from six independent companies.
-- `notebooks/GeoMapBench_RAG_Final.ipynb`: independent dense `base_rag` and dense `agentic_rag` runs for one answer model.
+- `notebooks/GeoMapBench_Evaluation.ipynb`: five multimodal models from five independent companies; Muse is removed.
+- `notebooks/GeoMapBench_RAG_Final.ipynb`: independent Claude dense `base_rag` and `agentic_rag` runs.
 
 The RAG pipeline is dense-only. It uses the corpus `text.faiss` index built with
 `BAAI/bge-small-en-v1.5`, optionally reranks candidates with
@@ -23,9 +23,12 @@ with `--preflight-cache`: a successful preflight is skipped when the canonical
 JSONL files, referenced assets, prompt revision, and image converter revision are
 unchanged. Use `--force-preflight` after changing benchmark data.
 
-Always run the 23-record pilot (`--per-leaf-limit 1`) before a full publication
-run, then a 115-record stability pilot (`--per-leaf-limit 5`). Do not proceed
-while any model has a nonzero `generation_failure_rate`.
+Both suites use a deterministic nested Bloom-stratified cohort. Keep one output
+directory and increase `--target-per-leaf`: target 1 contains 23 records, target
+6 contains 138 total records, and target 100 is the complete 2,300-record run.
+Increasing 1 to 6 runs only the 115 missing records. The first canonical record
+is retained for compatibility with the old one-per-leaf pilot, then the selector
+covers all supported Bloom levels before repeating levels.
 
 Every condition writes `run_state.json`, `inflight.json`, and a write-ahead
 `api_responses.jsonl` cache. A response received immediately before a runtime
@@ -326,36 +329,38 @@ geomapbench-data validate --root C:\data\geomapbench_100 --require-all
 geomapbench-data bloom-audit --root C:\data\geomapbench_100
 geomapbench-data clean --root C:\data\geomapbench_100
 
-# Base model-suite pilot (one canonical record per leaf).
+# Cumulative model suite. Reuse the same output and increase the target.
 geomapbench-eval suite `
   --benchmark-root C:\data\geomapbench_100 `
-  --models config\evaluation_models_2026-09-v6.json `
-  --output results\model_suite_1_per_leaf_v6 `
+  --models config\evaluation_models_2026-09-v7.json `
+  --output results\model_suite_cumulative_v7 `
   --preflight-cache cache\preflight `
-  --per-leaf-limit 1
+  --target-per-leaf 6 `
+  --legacy-output results\model_suite_1_per_leaf_v6 `
+  --legacy-output results\model_suite_6_per_leaf_v6
 
 # Independent dense-only RAG pilot. It needs no Base/Evaluation output.
 geomapbench-eval rag-suite `
   --benchmark-root C:\data\geomapbench_100 `
   --corpus-root C:\data\GeoMapRAG_Corpus `
   --work-root C:\temp\geomaprag `
-  --output results\rag_suite_1_per_leaf_v6 `
-  --models config\evaluation_models_2026-09-v6.json `
-  --model mistralai/mistral-small-2603 `
+  --output results\rag_suite_cumulative_v7 `
+  --models config\evaluation_models_2026-09-v7.json `
+  --model anthropic/claude-sonnet-5 `
   --agent-cache cache\agent_v191 `
   --preflight-cache cache\preflight `
   --conditions base_rag,agentic_rag `
-  --per-leaf-limit 1
+  --target-per-leaf 6
 
 geomapbench-eval analyze `
-  --results results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\responses.jsonl `
-  --output results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\analysis
+  --results results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\responses.jsonl `
+  --output results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\analysis
 
 # Later, after transferring the independently completed folders to one machine:
 geomapbench-eval compare `
-  --base-results results\model_suite_1_per_leaf_v6\mistralai_mistral-small-2603\responses.jsonl `
-  --rag-results results\rag_suite_1_per_leaf_v6\agentic_rag\responses.jsonl `
-  --output results\mistral_small_agentic_comparison
+  --base-results results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\responses.jsonl `
+  --rag-results results\rag_suite_cumulative_v7\agentic_rag\responses.jsonl `
+  --output results\claude_agentic_comparison
 ```
 
 The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf
@@ -367,8 +372,8 @@ changes to RAG. The command
 writes a per-leaf CSV, macro averages, Bloom-level summary, format-failure
 rate, bootstrap confidence intervals, latency, and OpenRouter-reported cost.
 
-For a paper release, create a separate output directory per model/condition,
-pin the exact model ID, store the API response metadata, and do not use
+For a paper release, keep the cumulative output directory fixed, pin the exact
+model ID, store the API response metadata, and do not use
 `--force` on a completed output directory: it intentionally reruns records and
 appends another immutable response row. Use `--no-images` only for a declared
 text-only ablation, never as the default comparison for visual leaves.

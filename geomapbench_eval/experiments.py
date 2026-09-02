@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import analyze, compare
+from .benchmark import canonical_benchmark_records
 from .common import atomic_json
+from .cumulative import migrate_legacy_base_outputs, write_cohort_manifest
 from .openrouter import OpenRouterClient
 from .preflight import benchmark_preflight
 from .rag import AgenticRAGRetriever, DenseRAGRetriever, stage_corpus
@@ -67,7 +69,9 @@ def _run_namespace(
         max_image_bytes=8_000_000,
         max_cost_usd=getattr(args, "max_cost_usd_per_model", None),
         limit=None,
-        per_leaf_limit=args.per_leaf_limit,
+        per_leaf_limit=None,
+        record_ids_file=getattr(args, "record_ids_file", None),
+        cumulative=bool(getattr(args, "cumulative", False)),
         progress_every=args.progress_every,
         no_images=False,
         no_clean=False,
@@ -82,6 +86,30 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         Path(args.benchmark_root), cache_root=cache,
         force=args.force_preflight, max_image_bytes=8_000_000,
     )
+
+
+def _cumulative_target(
+    args: argparse.Namespace,
+    *,
+    output: Path,
+    preflight: dict[str, Any],
+) -> tuple[list[tuple[Path, dict[str, Any]]], dict[str, Any]]:
+    records = canonical_benchmark_records(Path(args.benchmark_root), prefer_clean=True)
+    cohort_path, cohort = write_cohort_manifest(
+        records,
+        target_per_leaf=int(args.target_per_leaf),
+        output_root=output,
+        benchmark_content_hash=str(preflight["portable_benchmark_hash"]),
+    )
+    args.record_ids_file = str(cohort_path)
+    args.cumulative = True
+    print(
+        f"[cohort] cumulative target={cohort['target_per_leaf']} per leaf | "
+        f"records={cohort['target_record_count']} | bloom-stratified | "
+        f"ids={cohort['selected_ids_hash'][:12]}",
+        flush=True,
+    )
+    return records, cohort
 
 
 def _catalog_check(model_rows: list[dict[str, Any]]) -> dict[str, str]:
@@ -128,10 +156,20 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[suite] output: {output}", flush=True)
     preflight = _preflight(args)
     args.benchmark_content_hash = preflight["portable_benchmark_hash"]
+    benchmark_records, cohort = _cumulative_target(
+        args, output=output, preflight=preflight,
+    )
     model_rows = _models(Path(args.models))
     print(f"[suite] loaded {len(model_rows)} configured models", flush=True)
     reports: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
+    migration_reports: list[dict[str, Any]] = []
+    records_by_id = {
+        str(record.get("id")): (directory, record)
+        for directory, record in benchmark_records
+    }
+    prompt_hash_cache: dict[str, str] = {}
+    legacy_roots = [Path(value) for value in (getattr(args, "legacy_output", None) or [])]
     if not args.skip_model_preflight:
         problems = _catalog_check(model_rows)
         failures.extend({"model": model, "error": error} for model, error in sorted(problems.items()))
@@ -141,6 +179,21 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
         print(f"[suite {index}/{len(model_rows)}] START {model}", flush=True)
         model_output = output / _slug(model)
         try:
+            if legacy_roots:
+                migration = migrate_legacy_base_outputs(
+                    [root / _slug(model) for root in legacy_roots],
+                    destination=model_output,
+                    model=model,
+                    target_ids=set(cohort["selected_ids"]),
+                    records_by_id=records_by_id,
+                    prompt_hash_cache=prompt_hash_cache,
+                )
+                migration_reports.append(migration)
+                print(
+                    f"[migration] {model}: imported {migration['results_imported']} completed "
+                    f"rows and {migration['api_responses_imported']} raw API responses",
+                    flush=True,
+                )
             namespace = _run_namespace(
                 args,
                 output=model_output,
@@ -204,7 +257,14 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
     with (output / "model_suite_summary.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader(); writer.writerows(reports)
-    result = {"preflight": preflight, "models": reports, "failures": failures}
+    result = {
+        "preflight": preflight,
+        "cohort": cohort,
+        "models": reports,
+        "failures": failures,
+        "migration": migration_reports,
+    }
+    atomic_json(output / "migration_report.json", {"models": migration_reports})
     atomic_json(output / "model_suite_summary.json", result)
     print(f"[suite] finished: {len(reports)}/{len(model_rows)} model reports", flush=True)
     return result
@@ -229,6 +289,7 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
     temperature = model_row.get("temperature", 0.0)
     preflight = _preflight(args)
     args.benchmark_content_hash = preflight["portable_benchmark_hash"]
+    _, cohort = _cumulative_target(args, output=output, preflight=preflight)
     local_corpus = stage_corpus(Path(args.corpus_root), Path(args.work_root) / "corpus")
     reports: dict[str, Any] = {}
     for condition in requested:
@@ -290,6 +351,7 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
         }
     result = {
         "preflight": preflight,
+        "cohort": cohort,
         "model_config": model_row,
         "reports": reports,
         "comparisons": comparisons,
@@ -307,6 +369,14 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     suite.add_argument("--force-preflight", action="store_true")
     suite.add_argument("--skip-model-preflight", action="store_true")
     suite.add_argument("--per-leaf-limit", type=int)
+    suite.add_argument(
+        "--target-per-leaf", type=int, default=1,
+        help="Cumulative nested target per leaf; increasing it runs only missing IDs",
+    )
+    suite.add_argument(
+        "--legacy-output", action="append", default=[],
+        help="Legacy suite root to import once; may be repeated",
+    )
     suite.add_argument("--max-tokens", type=int, default=16384)
     suite.add_argument("--max-cost-usd-per-model", type=float, default=50.0)
     suite.add_argument("--progress-every", type=int, default=5)
@@ -328,6 +398,10 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     rag.add_argument("--model", required=True)
     rag.add_argument("--conditions", default="base_rag,agentic_rag")
     rag.add_argument("--per-leaf-limit", type=int)
+    rag.add_argument(
+        "--target-per-leaf", type=int, default=1,
+        help="Cumulative nested target per leaf shared with base evaluation",
+    )
     rag.add_argument("--max-cost-usd-per-model", type=float, default=25.0)
     rag.add_argument("--progress-every", type=int, default=5)
     rag.add_argument("--timeout-seconds", type=int, default=240)
