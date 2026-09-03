@@ -145,6 +145,32 @@ def test_legacy_migration_checks_prompt_model_condition_and_cohort(tmp_path: Pat
     assert report["rejected_or_duplicate_rows"] == 1
 
 
+def test_legacy_artifact_is_the_only_successful_row_scheduled_for_rerun(tmp_path: Path) -> None:
+    directory = tmp_path / "benchmark" / "dense_land_cover_labeling"
+    directory.mkdir(parents=True)
+    record = {
+        "id": "dense_land_cover_labeling-099", "leaf": "dense_land_cover_labeling",
+        "bloom": {"level": "C", "variant": "create_land_cover_mask"},
+        "input": {"question": "Create the mask.", "class_ontology": {"0": {"name": "water"}}},
+        "target": {"bloom_answer": "assets/099_mask.png"},
+        "evaluation": {"target_field": "target.bloom_answer", "type": "semantic_segmentation"},
+    }
+    source = tmp_path / "legacy"
+    append_jsonl(source / "responses.jsonl", {
+        "id": record["id"], "status": "ok", "condition": "base",
+        "model": "fake/model", "prompt_hash": "old-filename-prompt",
+        "response": '{"answer":"prediction.png"}',
+    })
+    report = migrate_legacy_base_outputs(
+        [source], destination=tmp_path / "final", model="fake/model",
+        target_ids={record["id"]}, records_by_id={record["id"]: (directory, record)},
+        prompt_hash_cache={},
+    )
+    assert report["results_imported"] == 0
+    assert report["artifact_rows_scheduled_for_rerun"] == 1
+    assert not (tmp_path / "final" / "responses.jsonl").exists()
+
+
 def test_runner_grows_in_place_and_calls_only_new_ids(tmp_path: Path) -> None:
     benchmark, output = tmp_path / "benchmark", tmp_path / "output"
     _benchmark(benchmark)
@@ -172,15 +198,16 @@ def test_runner_grows_in_place_and_calls_only_new_ids(tmp_path: Path) -> None:
     assert repeated["run_stop_reason"] == "already_complete"
 
 
-def test_v7_matrix_has_five_companies_no_muse_and_claude_rag() -> None:
+def test_final_matrix_has_six_companies_no_muse_and_claude_rag() -> None:
     models = json.loads(
-        (ROOT / "config/evaluation_models_2026-09-v7.json").read_text(encoding="utf-8")
+        (ROOT / "config/evaluation_models_final.json").read_text(encoding="utf-8")
     )
-    assert len(models) == 5
+    assert len(models) == 6
     ids = {row["model"] for row in models}
     assert "meta/muse-spark-1.2" not in ids
     assert {model.split("/", 1)[0] for model in ids} == {
-        "openai", "google", "mistralai", "qwen", "anthropic",
+        "openai", "google", "mistralai", "qwen", "anthropic", "meta-llama",
     }
     by_id = {row["model"]: row for row in models}
     assert by_id["anthropic/claude-sonnet-5"]["recommended_for_rag"] is True
+    assert by_id["meta-llama/llama-4-scout"]["tier"] == "economy-open-baseline"

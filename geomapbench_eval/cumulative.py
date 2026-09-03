@@ -9,6 +9,7 @@ from geomapbench_data.bloom import BLOOM_LEVELS
 
 from .common import append_jsonl, atomic_json, digest, read_jsonl
 from .prompts import build_messages
+from .scoring import is_artifact_target
 
 
 COHORT_REVISION = "2026-09-cumulative-bloom-v1"
@@ -167,7 +168,7 @@ def migrate_legacy_base_outputs(
         str(row.get("cache_key")) for row in (read_jsonl(api_path) if api_path.exists() else [])
         if row.get("cache_key")
     }
-    imported_results = imported_api = rejected = 0
+    imported_results = imported_api = rejected = artifact_reruns = 0
     source_reports: list[dict[str, Any]] = []
     for source in legacy_outputs:
         source = source.expanduser().resolve()
@@ -177,6 +178,10 @@ def migrate_legacy_base_outputs(
         if source_result.exists():
             for row in read_jsonl(source_result):
                 record_id = str(row.get("id"))
+                expected_hash = (
+                    _expected_prompt_hash(record_id, records_by_id, prompt_hash_cache)
+                    if record_id in records_by_id else None
+                )
                 if (
                     row.get("status") != "ok"
                     or row.get("condition") != "base"
@@ -184,10 +189,19 @@ def migrate_legacy_base_outputs(
                     or record_id not in target_ids
                     or record_id in completed
                     or record_id not in records_by_id
-                    or row.get("prompt_hash") != _expected_prompt_hash(
-                        record_id, records_by_id, prompt_hash_cache
-                    )
+                    or row.get("prompt_hash") != expected_hash
                 ):
+                    if (
+                        record_id in records_by_id
+                        and record_id in target_ids
+                        and row.get("status") == "ok"
+                        and row.get("condition") == "base"
+                        and row.get("model") == model
+                        and is_artifact_target(records_by_id[record_id][1])
+                        and record_id not in completed
+                        and row.get("prompt_hash") != expected_hash
+                    ):
+                        artifact_reruns += 1
                     rejected += 1
                     continue
                 append_jsonl(result_path, row)
@@ -224,6 +238,7 @@ def migrate_legacy_base_outputs(
         "destination": str(destination),
         "results_imported": imported_results,
         "api_responses_imported": imported_api,
+        "artifact_rows_scheduled_for_rerun": artifact_reruns,
         "rejected_or_duplicate_rows": rejected,
         "sources": source_reports,
     }

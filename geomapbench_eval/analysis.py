@@ -2,19 +2,32 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from .common import atomic_json, read_jsonl
+from .benchmark import canonical_benchmark_records
+from .common import atomic_json, atomic_jsonl, read_jsonl, utc_now
+from .scoring import extract_answer
+from .task_metrics import LOWER_IS_BETTER, TASK_METRIC_REVISION, TASK_METRIC_SCHEMA, evaluate_task_aware
 
 
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def _ci(values: list[float], seed: int = 41023, rounds: int = 2000) -> tuple[float, float]:
+def _median(values: list[float]) -> float:
+    values = sorted(values)
+    if not values:
+        return 0.0
+    middle = len(values) // 2
+    return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
+
+
+def _ci(values: list[float], seed: int = 41023, rounds: int = 4000) -> tuple[float, float]:
     if len(values) < 2:
         return (_mean(values), _mean(values))
     rng = random.Random(seed)
@@ -22,191 +35,313 @@ def _ci(values: list[float], seed: int = 41023, rounds: int = 2000) -> tuple[flo
     return estimates[int(.025 * rounds)], estimates[int(.975 * rounds) - 1]
 
 
-def _plots(table: list[dict[str, Any]], bloom: dict[tuple[str, str], list[float]], output: Path) -> list[str]:
-    """Create compact paper-draft diagnostics; callers still receive tables if matplotlib is absent."""
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return []
-    created: list[str] = []
-    if table:
-        labels = [row["leaf"].replace("_", "\n") for row in table]
-        scores = [row["score"] for row in table]
-        fig, axis = plt.subplots(figsize=(max(10, len(labels) * .42), 5))
-        axis.bar(range(len(labels)), scores, color="#377eb8")
-        axis.set(xticks=range(len(labels)), xticklabels=labels, ylim=(0, 1), ylabel="Score", title="GeoMapBench score by leaf")
-        axis.tick_params(axis="x", labelrotation=60, labelsize=7)
-        fig.tight_layout(); path = output / "per_leaf.png"; fig.savefig(path, dpi=220); plt.close(fig)
-        created.append(path.name)
-    if bloom:
-        order = ["R", "U", "Ap", "An", "E", "C"]
-        grouped: dict[str, dict[str, float]] = defaultdict(dict)
-        for (condition, level), values in bloom.items():
-            grouped[condition][level] = _mean(values)
-        fig, axis = plt.subplots(figsize=(6.5, 4))
-        for condition, values in sorted(grouped.items()):
-            levels = [level for level in order if level in values]
-            axis.plot(levels, [values[level] for level in levels], marker="o", label=condition)
-        axis.set(ylim=(0, 1), xlabel="Bloom level", ylabel="Score", title="Score by Bloom level")
-        axis.legend(); fig.tight_layout(); path = output / "bloom.png"; fig.savefig(path, dpi=220); plt.close(fig)
-        created.append(path.name)
-    return created
+def _answer_target(record: dict[str, Any]) -> Any:
+    target = record.get("target") or {}
+    path = str((record.get("evaluation") or {}).get("target_field") or "")
+    if path.startswith("target."):
+        return target.get(path.split(".", 1)[1])
+    return target.get("bloom_answer", target.get("answer", target))
 
 
-def analyze(results_path: Path, output: Path, *, make_plots: bool = True) -> dict[str, Any]:
-    rows = [row for row in read_jsonl(results_path) if row.get("status") == "ok" and isinstance(row.get("score"), (int, float))]
+def _norm(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).strip().casefold())
+
+
+def _macro_f1(pairs: list[tuple[Any, Any]]) -> float | None:
+    clean = [(_norm(prediction), _norm(gold)) for prediction, gold in pairs if prediction is not None]
+    if not clean:
+        return None
+    labels = sorted({value for pair in clean for value in pair})
+    values = []
+    for label in labels:
+        tp = sum(prediction == label and gold == label for prediction, gold in clean)
+        fp = sum(prediction == label and gold != label for prediction, gold in clean)
+        fn = sum(prediction != label and gold == label for prediction, gold in clean)
+        values.append(0.0 if 2 * tp + fp + fn == 0 else 2 * tp / (2 * tp + fp + fn))
+    return _mean(values)
+
+
+def canonical_rows(path: Path) -> list[dict[str, Any]]:
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in read_jsonl(path) if path.exists() else []:
+        key = (str(row.get("id")), str(row.get("model")), str(row.get("condition")))
+        latest[key] = row
+    return [latest[key] for key in sorted(latest)]
+
+
+def rescore_in_place(results_path: Path, benchmark_root: Path) -> dict[str, Any]:
+    """Upgrade saved raw responses without making any model/API calls."""
+    records = canonical_benchmark_records(benchmark_root, prefer_clean=True)
+    by_id = {str(record.get("id")): (directory, record) for directory, record in records}
+    rows = canonical_rows(results_path)
+    rescored = missing_benchmark = 0
+    for row in rows:
+        record_id = str(row.get("id"))
+        if row.get("status") != "ok" or record_id not in by_id:
+            missing_benchmark += int(record_id not in by_id)
+            continue
+        task_dir, record = by_id[record_id]
+        row.update(evaluate_task_aware(record, str(row.get("response") or ""), task_dir))
+        row["rescored_at"] = utc_now()
+        rescored += 1
+    atomic_jsonl(results_path, rows)
+    return {
+        "revision": TASK_METRIC_REVISION,
+        "canonical_rows": len(rows),
+        "rescored_rows": rescored,
+        "missing_benchmark_rows": missing_benchmark,
+        "api_calls": 0,
+    }
+
+
+def _resolve_benchmark(results_path: Path, benchmark_root: Path | None) -> Path:
+    if benchmark_root is not None:
+        return benchmark_root.expanduser().resolve()
+    config = results_path.parent / "run_config.json"
+    if not config.is_file():
+        raise ValueError("Task-aware analysis needs --benchmark-root or a sibling run_config.json")
+    value = json.loads(config.read_text(encoding="utf-8")).get("benchmark_root")
+    if not value:
+        raise ValueError(f"benchmark_root is missing from {config}")
+    return Path(value).expanduser().resolve()
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]], fallback: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(rows[0]) if rows else fallback
+    # Later rows may have different leaf-specific metric columns.
+    for row in rows[1:]:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def analyze(
+    results_path: Path,
+    output: Path,
+    *,
+    benchmark_root: Path | None = None,
+    make_plots: bool = True,
+) -> dict[str, Any]:
+    output.mkdir(parents=True, exist_ok=True)
+    benchmark = _resolve_benchmark(results_path, benchmark_root)
+    rescore = rescore_in_place(results_path, benchmark)
+    benchmark_rows = canonical_benchmark_records(benchmark, prefer_clean=True)
+    records = {str(record.get("id")): record for _, record in benchmark_rows}
+    rows = [
+        row for row in canonical_rows(results_path)
+        if row.get("status") == "ok" and isinstance(row.get("task_score"), (int, float))
+    ]
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         groups[(str(row.get("condition", "base")), str(row.get("leaf", "unknown")))].append(row)
-    table: list[dict[str, Any]] = []
+
+    per_leaf: list[dict[str, Any]] = []
+    metrics_long: list[dict[str, Any]] = []
     for (condition, leaf), group in sorted(groups.items()):
-        values = [float(item["score"]) for item in group]
-        text_rows = [item for item in group if not item.get("artifact_target")]
-        text_values = [float(item["score"]) for item in text_rows]
-        low, high = _ci(values)
-        table.append({
-            "condition": condition, "leaf": leaf, "n": len(group),
-            "score": round(_mean(values), 4), "ci_low": round(low, 4), "ci_high": round(high, 4),
-            "text_answer_n": len(text_rows),
-            "text_answer_score": round(_mean(text_values), 4) if text_values else None,
-            "invalid_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4),
+        task_values = [float(item["task_score"]) for item in group]
+        strict_values = [float(item.get("strict_score", item.get("score", 0.0))) for item in group]
+        low, high = _ci(task_values)
+        metric_values: dict[str, list[float]] = defaultdict(list)
+        class_pairs: list[tuple[Any, Any]] = []
+        for item in group:
+            for name, value in (item.get("task_metrics") or {}).items():
+                if name != "task_aware_score" and isinstance(value, (int, float)):
+                    metric_values[str(name)].append(float(value))
+            record = records.get(str(item.get("id")))
+            if record and "macro_f1" in TASK_METRIC_SCHEMA.get(leaf, ()):
+                prediction, error = extract_answer(str(item.get("response") or ""))
+                class_pairs.append(("__invalid_json__" if error else prediction, _answer_target(record)))
+        macro_f1 = _macro_f1(class_pairs)
+        if macro_f1 is not None:
+            metric_values["macro_f1"].append(macro_f1)
+
+        schema = TASK_METRIC_SCHEMA.get(leaf, ("task_aware_score",))
+        leaf_row: dict[str, Any] = {
+            "condition": condition,
+            "leaf": leaf,
+            "n": len(group),
+            "task_aware_score": round(_mean(task_values), 4),
+            "task_ci_low": round(low, 4),
+            "task_ci_high": round(high, 4),
+            "strict_accuracy": round(_mean(strict_values), 4),
+            "invalid_json_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4),
             "generation_failure_rate": round(sum(bool(item.get("generation_failure")) for item in group) / len(group), 4),
             "cost_usd": round(sum(
-                float((item.get("usage") or {}).get("cost") or 0)
-                + float((item.get("retrieval_usage") or {}).get("cost") or 0)
+                float((item.get("usage") or {}).get("cost") or 0.0)
+                + float((item.get("retrieval_usage") or {}).get("cost") or 0.0)
                 for item in group
             ), 6),
-            "latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3),
+            "median_latency_seconds": round(_median([float(item.get("latency_seconds") or 0.0) for item in group]), 3),
+        }
+        for name in schema:
+            if name == "task_aware_score":
+                continue
+            values = metric_values.get(name, [])
+            if values:
+                aggregate = _median(values) if name in LOWER_IS_BETTER else _mean(values)
+                leaf_row[name] = round(aggregate, 6)
+                metrics_long.append({
+                    "condition": condition, "leaf": leaf, "metric": name,
+                    "value": round(aggregate, 6), "n": len(values),
+                    "direction": "lower" if name in LOWER_IS_BETTER else "higher",
+                })
+        metrics_long.append({
+            "condition": condition, "leaf": leaf, "metric": "task_aware_score",
+            "value": leaf_row["task_aware_score"], "n": len(task_values), "direction": "higher",
         })
-    macro: dict[str, list[float]] = defaultdict(list)
-    text_macro: dict[str, list[float]] = defaultdict(list)
-    bloom: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for row in table:
-        macro[row["condition"]].append(row["score"])
-        if row["text_answer_score"] is not None:
-            text_macro[row["condition"]].append(float(row["text_answer_score"]))
-    for row in rows:
-        if row.get("bloom"):
-            bloom[(str(row.get("condition")), str(row["bloom"]))].append(float(row["score"]))
-    output.mkdir(parents=True, exist_ok=True)
+        per_leaf.append(leaf_row)
+
     by_condition: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         by_condition[str(row.get("condition", "base"))].append(row)
-    condition_summary = {}
+    condition_summary: dict[str, dict[str, Any]] = {}
     for condition, group in sorted(by_condition.items()):
+        leaves = [row for row in per_leaf if row["condition"] == condition]
+        latencies = [float(item.get("latency_seconds") or 0.0) for item in group]
         condition_summary[condition] = {
             "n": len(group),
-            "micro_accuracy": round(_mean([float(item["score"]) for item in group]), 4),
+            "task_aware_macro": round(_mean([float(row["task_aware_score"]) for row in leaves]), 4),
+            "strict_macro_accuracy": round(_mean([float(row["strict_accuracy"]) for row in leaves]), 4),
+            "task_aware_micro": round(_mean([float(item["task_score"]) for item in group]), 4),
+            "strict_micro_accuracy": round(_mean([float(item.get("strict_score", 0.0)) for item in group]), 4),
             "invalid_json_rate": round(sum(bool(item.get("parse_error")) for item in group) / len(group), 4),
             "generation_failure_rate": round(sum(bool(item.get("generation_failure")) for item in group) / len(group), 4),
-            "artifact_target_rate": round(sum(bool(item.get("artifact_target")) for item in group) / len(group), 4),
-            "text_answer_micro_accuracy": round(_mean([
-                float(item["score"]) for item in group if not item.get("artifact_target")
-            ]), 4),
-            "mean_latency_seconds": round(_mean([float(item.get("latency_seconds") or 0) for item in group]), 3),
-            "agent_call_count": sum(int((item.get("retrieval_usage") or {}).get("calls") or 0) for item in group),
-            "agent_cached_call_count": sum(int((item.get("retrieval_usage") or {}).get("cached_calls") or 0) for item in group),
-            "agent_failure_count": sum(int((item.get("retrieval_usage") or {}).get("agent_failures") or 0) for item in group),
-            "records_with_agent_failure_rate": round(sum(
-                bool((item.get("retrieval_usage") or {}).get("agent_failures")) for item in group
-            ) / len(group), 4),
+            "format_reliability": round(sum(not item.get("parse_error") and not item.get("generation_failure") for item in group) / len(group), 4),
+            "median_latency_seconds": round(_median(latencies), 3),
+            "p95_latency_seconds": round(sorted(latencies)[max(0, int(.95 * len(latencies)) - 1)], 3),
             "total_cost_usd": round(sum(
-                float((item.get("usage") or {}).get("cost") or 0)
-                + float((item.get("retrieval_usage") or {}).get("cost") or 0)
+                float((item.get("usage") or {}).get("cost") or 0.0)
+                + float((item.get("retrieval_usage") or {}).get("cost") or 0.0)
                 for item in group
             ), 6),
+            "agent_call_count": sum(int((item.get("retrieval_usage") or {}).get("calls") or 0) for item in group),
+            "agent_cached_call_count": sum(int((item.get("retrieval_usage") or {}).get("cached_calls") or 0) for item in group),
         }
+
+    bloom: dict[tuple[str, str], list[float]] = defaultdict(list)
+    for row in rows:
+        if row.get("bloom"):
+            bloom[(str(row.get("condition")), str(row.get("bloom")))].append(float(row["task_score"]))
     summary = {
+        "task_metric_revision": TASK_METRIC_REVISION,
         "record_count": len(rows),
-        "macro_by_condition": {key: round(_mean(value), 4) for key, value in sorted(macro.items())},
-        "text_answer_macro_by_condition": {key: round(_mean(value), 4) for key, value in sorted(text_macro.items())},
+        "rescore": rescore,
         "condition_summary": condition_summary,
-        "bloom_by_condition": {f"{condition}:{level}": round(_mean(value), 4) for (condition, level), value in sorted(bloom.items())},
-        "per_leaf": table,
-        "plots": _plots(table, bloom, output) if make_plots else [],
+        "task_aware_macro_by_condition": {key: value["task_aware_macro"] for key, value in condition_summary.items()},
+        "strict_macro_by_condition": {key: value["strict_macro_accuracy"] for key, value in condition_summary.items()},
+        "macro_by_condition": {key: value["strict_macro_accuracy"] for key, value in condition_summary.items()},
+        "text_answer_macro_by_condition": {key: value["strict_macro_accuracy"] for key, value in condition_summary.items()},
+        "bloom_task_score_by_condition": {
+            f"{condition}:{level}": round(_mean(values), 4)
+            for (condition, level), values in sorted(bloom.items())
+        },
+        "per_leaf": per_leaf,
+        "task_metrics": metrics_long,
     }
     atomic_json(output / "summary.json", summary)
-    with (output / "per_leaf.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(table[0]) if table else ["condition", "leaf", "n", "score"])
-        writer.writeheader(); writer.writerows(table)
+    _write_csv(output / "per_leaf.csv", per_leaf, ["condition", "leaf", "n", "task_aware_score"])
+    _write_csv(output / "task_metrics_long.csv", metrics_long, ["condition", "leaf", "metric", "value", "n", "direction"])
     return summary
 
 
 def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
-    """Compare two completed conditions by the same record IDs."""
+    """Paired, protocol-locked comparison using task-aware and strict scores."""
     fairness_fields = (
         "model", "temperature", "max_tokens", "reasoning_effort", "reasoning_enabled", "top_k",
         "include_images", "per_leaf_limit", "limit", "target_record_count",
-        "selected_ids_hash", "selected_records_hash", "protocol",
-        "benchmark_content_hash",
+        "selected_ids_hash", "selected_records_hash", "protocol", "benchmark_content_hash",
     )
 
     def run_config(path: Path) -> dict[str, Any]:
         config_path = path.parent / "run_config.json"
         if not config_path.is_file():
-            raise FileNotFoundError(
-                f"Missing run_config.json beside {path}; protocol-locked comparison is impossible"
-            )
-        return __import__("json").loads(config_path.read_text(encoding="utf-8"))
+            raise FileNotFoundError(f"Missing run_config.json beside {path}")
+        return json.loads(config_path.read_text(encoding="utf-8"))
 
     first_config, second_config = run_config(base_path), run_config(rag_path)
     mismatches = [
         f"{field}: {first_config.get(field)!r} != {second_config.get(field)!r}"
-        for field in fairness_fields
-        if first_config.get(field) != second_config.get(field)
+        for field in fairness_fields if first_config.get(field) != second_config.get(field)
     ]
     if mismatches:
-        raise ValueError(
-            "Runs are not evaluation-protocol compatible; comparison refused.\n - "
-            + "\n - ".join(mismatches)
-        )
+        raise ValueError("Runs are not evaluation-protocol compatible; comparison refused.\n - " + "\n - ".join(mismatches))
+
+    # Standalone comparisons must be just as safe as suite-driven comparisons.
+    # Upgrade historical rows from their stored raw responses before reading
+    # task-aware scores; this performs no API/model calls.
+    first_benchmark = Path(str(first_config["benchmark_root"])).expanduser().resolve()
+    second_benchmark = Path(str(second_config["benchmark_root"])).expanduser().resolve()
+    rescore_in_place(base_path, first_benchmark)
+    rescore_in_place(rag_path, second_benchmark)
 
     def scored(path: Path) -> dict[str, dict[str, Any]]:
         return {
-            str(row["id"]): row for row in read_jsonl(path)
-            if row.get("status") == "ok" and isinstance(row.get("score"), (int, float))
+            str(row["id"]): row for row in canonical_rows(path)
+            if row.get("status") == "ok" and isinstance(row.get("task_score"), (int, float))
         }
-    base, rag = scored(base_path), scored(rag_path)
-    common = sorted(set(base) & set(rag))
-    if not common:
-        raise ValueError("No common successful record IDs between base and RAG results")
-    if set(base) != set(rag):
+
+    first, second = scored(base_path), scored(rag_path)
+    if set(first) != set(second) or not first:
         raise ValueError(
             "Runs do not contain the exact same completed record IDs; comparison refused "
-            f"(first_only={len(set(base) - set(rag))}, second_only={len(set(rag) - set(base))})"
+            f"(first_only={len(set(first) - set(second))}, second_only={len(set(second) - set(first))})"
         )
-    rows = [{"id": record_id, "leaf": str(base[record_id].get("leaf", "unknown")), "base_score": float(base[record_id]["score"]), "rag_score": float(rag[record_id]["score"])} for record_id in common]
-    for row in rows:
-        row["delta"] = row["rag_score"] - row["base_score"]
+    rows: list[dict[str, Any]] = []
+    for record_id in sorted(first):
+        first_task, second_task = float(first[record_id]["task_score"]), float(second[record_id]["task_score"])
+        first_strict = float(first[record_id].get("strict_score", 0.0))
+        second_strict = float(second[record_id].get("strict_score", 0.0))
+        rows.append({
+            "id": record_id, "leaf": str(first[record_id].get("leaf", "unknown")),
+            "first_task_score": first_task, "second_task_score": second_task,
+            "task_delta": second_task - first_task,
+            "first_strict_score": first_strict, "second_strict_score": second_strict,
+            "strict_delta": second_strict - first_strict,
+        })
+    task_deltas = [row["task_delta"] for row in rows]
+    strict_deltas = [row["strict_delta"] for row in rows]
+    task_low, task_high = _ci(task_deltas)
+    strict_low, strict_high = _ci(strict_deltas)
     by_leaf: dict[str, list[float]] = defaultdict(list)
     for row in rows:
-        by_leaf[row["leaf"]].append(row["delta"])
-    deltas = [row["delta"] for row in rows]
-    low, high = _ci(deltas)
+        by_leaf[row["leaf"]].append(row["task_delta"])
     summary = {
         "protocol_validation": "pass",
         "first_condition": first_config.get("condition"),
         "second_condition": second_config.get("condition"),
-        "paired_record_count": len(rows), "base_only_records": len(set(base) - set(rag)),
-        "rag_only_records": len(set(rag) - set(base)), "mean_delta": round(_mean(deltas), 4),
-        "delta_ci_low": round(low, 4), "delta_ci_high": round(high, 4),
-        "per_leaf_delta": {leaf: round(_mean(values), 4) for leaf, values in sorted(by_leaf.items())},
+        "paired_record_count": len(rows),
+        "task_aware_mean_delta": round(_mean(task_deltas), 4),
+        "task_aware_delta_ci_low": round(task_low, 4),
+        "task_aware_delta_ci_high": round(task_high, 4),
+        "strict_mean_delta": round(_mean(strict_deltas), 4),
+        "strict_delta_ci_low": round(strict_low, 4),
+        "strict_delta_ci_high": round(strict_high, 4),
+        "win_tie_loss": {
+            "wins": sum(value > 0 for value in task_deltas),
+            "ties": sum(value == 0 for value in task_deltas),
+            "losses": sum(value < 0 for value in task_deltas),
+        },
+        "per_leaf_task_delta": {leaf: round(_mean(values), 4) for leaf, values in sorted(by_leaf.items())},
     }
     output.mkdir(parents=True, exist_ok=True)
     atomic_json(output / "rag_comparison.json", summary)
-    with (output / "rag_comparison.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["id", "leaf", "base_score", "rag_score", "delta"])
-        writer.writeheader(); writer.writerows(rows)
+    _write_csv(output / "rag_comparison.csv", rows, ["id", "leaf", "task_delta"])
     return summary
 
 
 def add_analyze_parser(sub: argparse._SubParsersAction[Any]) -> None:
-    parser = sub.add_parser("analyze", help="Aggregate scored results into publication-ready tables with bootstrap CIs.")
-    parser.add_argument("--results", required=True, help="responses.jsonl from one run")
+    parser = sub.add_parser("analyze", help="Offline task-aware rescoring and publication tables; no API calls.")
+    parser.add_argument("--results", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--benchmark-root")
     parser.add_argument("--no-plots", action="store_true")
 
-    compare_parser = sub.add_parser("compare", help="Produce paired base-versus-RAG improvements by record ID.")
+    compare_parser = sub.add_parser("compare", help="Produce a paired protocol-locked condition comparison.")
     compare_parser.add_argument("--base-results", required=True)
     compare_parser.add_argument("--rag-results", required=True)
     compare_parser.add_argument("--output", required=True)

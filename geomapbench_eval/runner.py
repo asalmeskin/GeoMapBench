@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .benchmark import canonical_benchmark_records, stable_subset
-from .common import append_jsonl, atomic_json, digest, read_jsonl, stable_json, utc_now
+from .common import append_jsonl, atomic_json, atomic_jsonl, digest, read_jsonl, stable_json, utc_now
 from .openrouter import (
     OpenRouterClient,
     OpenRouterConfig,
@@ -18,7 +18,8 @@ from .openrouter import (
 )
 from .prompts import build_messages
 from .protocol import protocol_descriptor
-from .scoring import is_artifact_target, score
+from .scoring import is_artifact_target
+from .task_metrics import evaluate_task_aware
 
 
 class Retriever(Protocol):
@@ -165,7 +166,7 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
     )
     identity = experiment_identity(args)
     run_config = {
-        "format": "GeoMapBench OpenRouter cumulative evaluation v7",
+        "format": "GeoMapBench OpenRouter final task-aware evaluation v2.1",
         "created_at": utc_now(),
         "model": args.model,
         "condition": condition,
@@ -361,7 +362,7 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
 
             raw_text = response_text(response)
             failure_kind = generation_failure(response, raw_text)
-            evaluation = score(record, raw_text)
+            evaluation = evaluate_task_aware(record, raw_text, task_dir)
             usage = response.get("usage") or {}
             cost = float(usage.get("cost") or 0.0)
             if not cached:
@@ -452,6 +453,14 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
         record_id: row for record_id, row in completed_rows(result_path).items()
         if record_id in target_ids
     }
+    # Keep append+fsync safety during inference, then leave one canonical final
+    # row per record instead of accumulating generations of duplicate rows.
+    compacted: dict[str, dict[str, Any]] = {}
+    for row in _rows(result_path):
+        compacted[str(row.get("id"))] = row
+    atomic_jsonl(result_path, [compacted[key] for key in sorted(compacted)])
+    cache_compacted = _cached_api_responses(api_cache_path)
+    atomic_jsonl(api_cache_path, [cache_compacted[key] for key in sorted(cache_compacted)])
     complete = len(final_completed) == len(experiment)
     if stop_reason is None:
         stop_reason = "completed" if complete else "incomplete_errors"

@@ -17,7 +17,12 @@ def main(argv: list[str] | None = None) -> int:
         validate_run_args(args)
         print(json.dumps(run(args), indent=2, sort_keys=True))
     elif args.command == "analyze":
-        print(json.dumps(analyze(__import__("pathlib").Path(args.results), __import__("pathlib").Path(args.output), make_plots=not args.no_plots), indent=2, sort_keys=True))
+        pathlib = __import__("pathlib")
+        print(json.dumps(analyze(
+            pathlib.Path(args.results), pathlib.Path(args.output),
+            benchmark_root=pathlib.Path(args.benchmark_root) if args.benchmark_root else None,
+            make_plots=not args.no_plots,
+        ), indent=2, sort_keys=True))
     elif args.command == "compare":
         print(json.dumps(compare(__import__("pathlib").Path(args.base_results), __import__("pathlib").Path(args.rag_results), __import__("pathlib").Path(args.output)), indent=2, sort_keys=True))
     elif args.command == "suite":

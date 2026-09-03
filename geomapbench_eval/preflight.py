@@ -14,7 +14,7 @@ from .prompts import (
 )
 
 
-PREFLIGHT_REVISION = "2026-09-cache-v4-protocol-190"
+PREFLIGHT_REVISION = "2026-09-cache-v5-final-210"
 
 
 def _sha256_file(path: Path) -> str:
@@ -157,8 +157,8 @@ def benchmark_preflight(
     print(f"[preflight] PASS: {len(assets)} unique assets validated", flush=True)
     if report["artifact_target_warnings"]:
         print(
-            "[preflight:warning] some generated benchmark variants request file-like artifacts; "
-            "they remain in the run but should be reported separately in a paper",
+            "[preflight] file-artifact targets detected; the final inline RLE/graph contracts "
+            "will make these predictions locally measurable",
             flush=True,
         )
     return report

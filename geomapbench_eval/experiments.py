@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from .benchmark import canonical_benchmark_records
 from .common import atomic_json
 from .cumulative import migrate_legacy_base_outputs, write_cohort_manifest
 from .openrouter import OpenRouterClient
+from .plots import benchmark_plots, rag_plots
 from .preflight import benchmark_preflight
 from .rag import AgenticRAGRetriever, DenseRAGRetriever, stage_corpus
 from .runner import run
@@ -160,6 +162,7 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
         args, output=output, preflight=preflight,
     )
     model_rows = _models(Path(args.models))
+    expected_model_count = len(model_rows)
     print(f"[suite] loaded {len(model_rows)} configured models", flush=True)
     reports: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
@@ -205,9 +208,13 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 temperature=model_row.get("temperature", 0.0),
             )
             invocation = run(namespace)
-            summary = analyze(model_output / "responses.jsonl", model_output / "analysis")
+            summary = analyze(
+                model_output / "responses.jsonl", model_output / "analysis",
+                benchmark_root=Path(args.benchmark_root),
+            )
             condition = summary["condition_summary"].get("base", {})
-            macro = summary["macro_by_condition"].get("base", 0.0)
+            strict_macro = summary["strict_macro_by_condition"].get("base", 0.0)
+            task_macro = summary["task_aware_macro_by_condition"].get("base", 0.0)
             complete = bool(invocation.get("complete"))
             report = {
                 "model": model,
@@ -217,15 +224,17 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
                 "n": condition.get("n", 0),
                 "target_n": invocation.get("target_records"),
                 "complete": complete,
-                "macro_accuracy": macro if complete else None,
-                "provisional_macro_accuracy": macro,
-                "text_answer_macro_accuracy": summary["text_answer_macro_by_condition"].get("base", 0.0),
-                "micro_accuracy": condition.get("micro_accuracy", 0.0),
-                "text_answer_micro_accuracy": condition.get("text_answer_micro_accuracy", 0.0),
-                "artifact_target_rate": condition.get("artifact_target_rate", 0.0),
+                "task_aware_macro": task_macro if complete else None,
+                "provisional_task_aware_macro": task_macro,
+                "strict_macro_accuracy": strict_macro if complete else None,
+                "provisional_strict_macro_accuracy": strict_macro,
+                "task_aware_micro": condition.get("task_aware_micro", 0.0),
+                "strict_micro_accuracy": condition.get("strict_micro_accuracy", 0.0),
                 "invalid_json_rate": condition.get("invalid_json_rate", 0.0),
                 "generation_failure_rate": condition.get("generation_failure_rate", 0.0),
-                "mean_latency_seconds": condition.get("mean_latency_seconds", 0.0),
+                "format_reliability": condition.get("format_reliability", 0.0),
+                "median_latency_seconds": condition.get("median_latency_seconds", 0.0),
+                "p95_latency_seconds": condition.get("p95_latency_seconds", 0.0),
                 "reported_cost_usd": invocation.get(
                     "reported_cost_usd_total", condition.get("total_cost_usd", 0.0)
                 ),
@@ -234,7 +243,8 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
             reports.append(report)
             print(
                 f"[suite {index}/{len(model_rows)}] {'DONE' if complete else 'PAUSED'} {model}: "
-                f"n={report['n']}/{report['target_n']} macro={report['provisional_macro_accuracy']} "
+                f"n={report['n']}/{report['target_n']} task-aware={report['provisional_task_aware_macro']} "
+                f"strict={report['provisional_strict_macro_accuracy']} "
                 f"invalid={report['invalid_json_rate']} "
                 f"generation_fail={report['generation_failure_rate']} ${report['reported_cost_usd']:.4f}",
                 flush=True,
@@ -244,25 +254,46 @@ def run_model_suite(args: argparse.Namespace) -> dict[str, Any]:
             print(f"[suite {index}/{len(model_rows)}] FAILED {model}: {error!r}", flush=True)
     reports.sort(key=lambda row: (
         not bool(row["complete"]),
-        -float(row["provisional_macro_accuracy"]),
+        -float(row["provisional_task_aware_macro"]),
         float(row["reported_cost_usd"]),
     ))
     fieldnames = [
         "model", "family", "tier", "open_weights", "n", "target_n", "complete",
-        "macro_accuracy", "provisional_macro_accuracy", "text_answer_macro_accuracy",
-        "micro_accuracy", "text_answer_micro_accuracy", "artifact_target_rate",
-        "invalid_json_rate", "generation_failure_rate", "mean_latency_seconds",
+        "task_aware_macro", "provisional_task_aware_macro", "strict_macro_accuracy",
+        "provisional_strict_macro_accuracy", "task_aware_micro", "strict_micro_accuracy",
+        "invalid_json_rate", "generation_failure_rate", "format_reliability",
+        "median_latency_seconds", "p95_latency_seconds",
         "reported_cost_usd", "run_stop_reason",
     ]
     with (output / "model_suite_summary.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader(); writer.writerows(reports)
+    plot_files = benchmark_plots(output, model_rows)
+    cleanup: list[dict[str, Any]] = []
+    suite_complete = (
+        len(reports) == expected_model_count
+        and not failures
+        and all(bool(row.get("complete")) for row in reports)
+    )
+    if bool(getattr(args, "delete_legacy_after_success", False)) and suite_complete:
+        for candidate in legacy_roots:
+            source = candidate.expanduser().resolve()
+            entry = {"source": str(source), "deleted": False}
+            if source == output or source.parent != output.parent or not source.is_dir():
+                entry["reason"] = "not_an_existing_sibling_directory"
+            else:
+                shutil.rmtree(source)
+                entry["deleted"] = True
+                print(f"[migration] removed verified legacy suite: {source}", flush=True)
+            cleanup.append(entry)
     result = {
         "preflight": preflight,
         "cohort": cohort,
         "models": reports,
         "failures": failures,
         "migration": migration_reports,
+        "legacy_cleanup": cleanup,
+        "plots": plot_files,
     }
     atomic_json(output / "migration_report.json", {"models": migration_reports})
     atomic_json(output / "model_suite_summary.json", result)
@@ -324,7 +355,10 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
         invocation = run(namespace, retriever=retriever)
         reports[condition] = {
             "run": invocation,
-            "analysis": analyze(run_output / "responses.jsonl", run_output / "analysis"),
+            "analysis": analyze(
+                run_output / "responses.jsonl", run_output / "analysis",
+                benchmark_root=Path(args.benchmark_root),
+            ),
         }
         print(f"[rag-suite] DONE {condition}", flush=True)
         del retriever
@@ -349,12 +383,18 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
             "protocol_validation": "deferred",
             "reason": "Both conditions must reach their exact target record count; rerun the same cell to resume.",
         }
+    plot_files = rag_plots(
+        output,
+        {condition: value["analysis"] for condition, value in reports.items()},
+        comparisons.get("base_rag_to_agentic_rag"),
+    )
     result = {
         "preflight": preflight,
         "cohort": cohort,
         "model_config": model_row,
         "reports": reports,
         "comparisons": comparisons,
+        "plots": plot_files,
     }
     atomic_json(output / "rag_suite_summary.json", result)
     return result
@@ -376,6 +416,10 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     suite.add_argument(
         "--legacy-output", action="append", default=[],
         help="Legacy suite root to import once; may be repeated",
+    )
+    suite.add_argument(
+        "--delete-legacy-after-success", action="store_true",
+        help="Delete only explicitly listed sibling legacy roots after every final model is complete",
     )
     suite.add_argument("--max-tokens", type=int, default=16384)
     suite.add_argument("--max-cost-usd-per-model", type=float, default=50.0)

@@ -15,7 +15,7 @@ from PIL import Image
 from .common import stable_json
 
 
-PROMPT_REVISION = "2026-09-json-schema-v3-untrusted-input"
+PROMPT_REVISION = "2026-09-json-schema-v4-inline-artifacts"
 IMAGE_CONVERTER_REVISION = "2026-09-svg-tiff-v3"
 SUPPORTED_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 IMAGE_ASSET_KEYS = {
@@ -176,6 +176,12 @@ def _encode_image(path: Path, max_bytes: int) -> dict[str, Any]:
 def _answer_contract(record: dict[str, Any]) -> str:
     # Never inspect target values while constructing a model prompt. The public
     # metric family and the task wording are the only schema signals used here.
+    # Import lazily so the image transport module stays usable on its own.
+    from .task_metrics import artifact_contract
+
+    special = artifact_contract(record)
+    if special:
+        return special
     evaluation = record.get("evaluation") or {}
     kind = str(evaluation.get("type") or evaluation.get("metric") or "exact_match")
     if kind in {"numeric_tolerance", "numeric", "distance"}:

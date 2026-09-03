@@ -7,9 +7,10 @@ from typing import Any
 from . import __version__
 from .prompts import IMAGE_CONVERTER_REVISION, PROMPT_REVISION
 from .scoring import SCORING_REVISION
+from .task_metrics import ARTIFACT_PROTOCOL_REVISION, TASK_METRIC_REVISION
 
 
-EVALUATION_PROTOCOL_REVISION = "2026-09-cumulative-cohort-v4"
+EVALUATION_PROTOCOL_REVISION = "2026-09-final-task-aware-v1"
 
 
 def protocol_descriptor() -> dict[str, Any]:
@@ -31,6 +32,8 @@ def protocol_descriptor() -> dict[str, Any]:
         "package_version": __version__,
         "prompt_revision": PROMPT_REVISION,
         "scoring_revision": SCORING_REVISION,
+        "task_metric_revision": TASK_METRIC_REVISION,
+        "artifact_protocol_revision": ARTIFACT_PROTOCOL_REVISION,
         "image_converter_revision": IMAGE_CONVERTER_REVISION,
         "canonical_loader": "23x100-v1",
         "git_commit": commit,

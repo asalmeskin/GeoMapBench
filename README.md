@@ -1,11 +1,18 @@
 # GeoMapBench taxonomy data kit
 
-## Final cumulative evaluation workflow (v2.0.0)
+## Final cumulative evaluation workflow (v2.1.0)
 
 The final release includes two orchestration-only Colab notebooks:
 
-- `notebooks/GeoMapBench_Evaluation.ipynb`: five multimodal models from five independent companies; Muse is removed.
+- `notebooks/GeoMapBench_Evaluation_Final.ipynb`: six multimodal models from six independent companies, including the economical Llama 4 Scout baseline; Muse is removed.
 - `notebooks/GeoMapBench_RAG_Final.ipynb`: independent Claude dense `base_rag` and `agentic_rag` runs.
+
+Version 2.1 adds offline task-aware rescoring and publication figures. Existing
+raw responses are migrated into `model_suite_final` and rescored without API
+calls. Only legacy file-artifact rows are incompatible: their old prompt asked
+for a filename rather than a measurable prediction. Those rows alone receive a
+new inline RLE-mask or graph-JSON prompt. Invalid JSON and genuine token-limit
+failures remain final failures and are never selectively retried.
 
 The RAG pipeline is dense-only. It uses the corpus `text.faiss` index built with
 `BAAI/bge-small-en-v1.5`, optionally reranks candidates with
@@ -36,6 +43,12 @@ disconnect is recovered without another API call. Long exponential retry with
 jitter handles transient failures; persistent rate limits open a circuit breaker
 and pause the run so it can be resumed safely later. Partial runs are marked
 `complete=false` and are never promoted to final accuracy.
+
+After every invocation, append-safe stores are compacted to one canonical row
+per ID. The final analysis keeps strict accuracy, adds one normalized
+task-aware score plus at most two task-specific diagnostics per leaf, and writes
+Seaborn PNG/PDF figures with bold labels, no figure title, and one shared legend
+below each multi-series plot. See `METRICS_PROTOCOL.md`.
 
 The RAG notebook never launches a no-retrieval Base and has no dependency on an
 Evaluation output. Both notebooks load the same model matrix and save exact model
@@ -332,20 +345,20 @@ geomapbench-data clean --root C:\data\geomapbench_100
 # Cumulative model suite. Reuse the same output and increase the target.
 geomapbench-eval suite `
   --benchmark-root C:\data\geomapbench_100 `
-  --models config\evaluation_models_2026-09-v7.json `
-  --output results\model_suite_cumulative_v7 `
+  --models config\evaluation_models_final.json `
+  --output results\model_suite_final `
   --preflight-cache cache\preflight `
-  --target-per-leaf 6 `
-  --legacy-output results\model_suite_1_per_leaf_v6 `
-  --legacy-output results\model_suite_6_per_leaf_v6
+  --target-per-leaf 50 `
+  --legacy-output results\model_suite_cumulative_v7 `
+  --delete-legacy-after-success
 
 # Independent dense-only RAG pilot. It needs no Base/Evaluation output.
 geomapbench-eval rag-suite `
   --benchmark-root C:\data\geomapbench_100 `
   --corpus-root C:\data\GeoMapRAG_Corpus `
   --work-root C:\temp\geomaprag `
-  --output results\rag_suite_cumulative_v7 `
-  --models config\evaluation_models_2026-09-v7.json `
+  --output results\rag_suite_final `
+  --models config\evaluation_models_final.json `
   --model anthropic/claude-sonnet-5 `
   --agent-cache cache\agent_v191 `
   --preflight-cache cache\preflight `
@@ -353,19 +366,20 @@ geomapbench-eval rag-suite `
   --target-per-leaf 6
 
 geomapbench-eval analyze `
-  --results results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\responses.jsonl `
-  --output results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\analysis
+  --results results\model_suite_final\anthropic_claude-sonnet-5\responses.jsonl `
+  --output results\model_suite_final\anthropic_claude-sonnet-5\analysis `
+  --benchmark-root C:\data\geomapbench_100
 
 # Later, after transferring the independently completed folders to one machine:
 geomapbench-eval compare `
-  --base-results results\model_suite_cumulative_v7\anthropic_claude-sonnet-5\responses.jsonl `
-  --rag-results results\rag_suite_cumulative_v7\agentic_rag\responses.jsonl `
+  --base-results results\model_suite_final\anthropic_claude-sonnet-5\responses.jsonl `
+  --rag-results results\rag_suite_final\agentic_rag\responses.jsonl `
   --output results\claude_agentic_comparison
 ```
 
-The analysis command writes a per-leaf CSV and `summary.json`, plus a per-leaf
-bar chart and Bloom-level plot when Matplotlib is installed (pass `--no-plots`
-for a table-only run). The final RAG conditions use BGE dense retrieval and
+The analysis command writes `per_leaf.csv`, `task_metrics_long.csv`, and
+`summary.json`. Suite commands additionally write publication-ready Seaborn
+plots as both 300-DPI PNG and vector PDF. The final RAG conditions use BGE dense retrieval and
 cross-encoder reranking; `agentic_rag` adds a cached planner/judge loop. BM25 is
 not used. Inspect retrieved IDs and retrieval metrics before attributing answer
 changes to RAG. The command
