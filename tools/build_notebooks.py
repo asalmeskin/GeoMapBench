@@ -107,7 +107,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 version = subprocess.check_output(
     [sys.executable, "-c", "import geomapbench_eval; print(geomapbench_eval.__version__)"], text=True,
 ).strip()
-assert version == "2.2.0", f"Expected GeoMapBench 2.2.0, installed {version}"
+assert version == "2.2.1", f"Expected GeoMapBench 2.2.1, installed {version}"
 print("Installed final release:", version)
 '''
 
@@ -260,7 +260,7 @@ RAG = notebook([
     REQUEST_DELAY_SECONDS = 1.0
     PROGRESS_EVERY = 5
 
-    FINAL_OUTPUT_NAME = "rag_suite_multimodal_claude_v220"
+    FINAL_OUTPUT_NAME = "rag_suite_multimodal_claude_v221"
     TRUSTED_BENCHMARK_REPORT = f"{CACHE_ROOT}/preflight_final/benchmark_preflight.json"
     BASE_RESULTS = f"{RESULTS_ROOT}/model_suite_final/anthropic_claude-sonnet-5/responses.jsonl"
     INSTALL_RAG = True
@@ -294,11 +294,11 @@ print("New isolated multimodal output:", Path(RESULTS_ROOT) / FINAL_OUTPUT_NAME)
     command = [
         sys.executable, "-u", "-m", "geomapbench_eval", "rag-suite",
         "--benchmark-root", BENCHMARK_ROOT, "--corpus-root", CORPUS_ROOT,
-        "--work-root", "/content/geomaprag_multimodal_work_v220",
+        "--work-root", "/content/geomaprag_multimodal_work_v221",
         "--output", str(output), "--target-per-leaf", str(TARGET_PER_LEAF),
         "--models", str(repo / "config/evaluation_models_final.json"),
         "--benchmark-report", TRUSTED_BENCHMARK_REPORT,
-        "--agent-cache", str(Path(CACHE_ROOT) / "agent_cache_multimodal_v220"),
+        "--agent-cache", str(Path(CACHE_ROOT) / "agent_cache_multimodal_v221"),
         "--model", ANSWER_MODEL, "--agent-model", AGENT_MODEL,
         "--agent-reasoning-effort", "minimal",
         "--conditions", "multimodal_rag,agentic_multimodal_rag",

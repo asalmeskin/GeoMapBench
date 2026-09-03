@@ -1,13 +1,14 @@
 # GeoMapBench taxonomy data kit
 
-## Final cumulative evaluation workflow (v2.2.0)
+## Final cumulative evaluation workflow (v2.2.1)
 
 The final release includes two orchestration-only Colab notebooks:
 
 - `notebooks/GeoMapBench_Evaluation_Final.ipynb`: six multimodal models from six independent companies, including the economical Llama 4 Scout baseline; Muse is removed.
 - `notebooks/GeoMapBench_RAG_Final.ipynb`: isolated Claude `multimodal_rag` and `agentic_multimodal_rag` runs using both corpus text and corpus images.
 
-Version 2.2 corrects the earlier text-only retrieval path. Every applicable RAG
+Version 2.2.1 corrects the earlier text-only retrieval path and supports both
+legacy Tensor-returning and current ModelOutput-returning Transformers CLIP APIs. Every applicable RAG
 query searches the frozen 180,344-vector BGE text index and the frozen
 1,794-vector CLIP image index. Original benchmark images form the CLIP query;
 retrieved corpus images are encoded and sent to the answer model alongside
@@ -371,11 +372,11 @@ geomapbench-eval rag-suite `
   --benchmark-root C:\data\geomapbench_100 `
   --corpus-root C:\data\GeoMapRAG_Corpus `
   --work-root C:\temp\geomaprag `
-  --output results\rag_suite_multimodal_claude_v220 `
+  --output results\rag_suite_multimodal_claude_v221 `
   --models config\evaluation_models_final.json `
   --model anthropic/claude-sonnet-5 `
   --agent-model google/gemini-3.5-flash-lite `
-  --agent-cache cache\agent_cache_multimodal_v220 `
+  --agent-cache cache\agent_cache_multimodal_v221 `
   --benchmark-report cache\preflight\benchmark_preflight.json `
   --conditions multimodal_rag,agentic_multimodal_rag `
   --target-per-leaf 6
@@ -388,7 +389,7 @@ geomapbench-eval analyze `
 # Later, after transferring the independently completed folders to one machine:
 geomapbench-eval compare `
   --base-results results\model_suite_final\anthropic_claude-sonnet-5\responses.jsonl `
-  --rag-results results\rag_suite_multimodal_claude_v220\agentic_multimodal_rag\responses.jsonl `
+  --rag-results results\rag_suite_multimodal_claude_v221\agentic_multimodal_rag\responses.jsonl `
   --output results\claude_agentic_comparison
 ```
 

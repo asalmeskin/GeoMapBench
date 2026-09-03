@@ -80,6 +80,31 @@ def _record_text(record: dict[str, Any]) -> str:
     return (str(inp.get("title") or "") + "\n" + str(inp.get("text") or "")).strip()
 
 
+def _clip_feature_tensor(output: Any, *, expected_dimension: int, modality: str) -> Any:
+    """Accept both legacy Tensor and Transformers 5 ModelOutput CLIP APIs."""
+    candidates = [output]
+    for attribute in (f"{modality}_embeds", "pooler_output"):
+        value = getattr(output, attribute, None)
+        if value is not None:
+            candidates.append(value)
+    if isinstance(output, (tuple, list)):
+        candidates.extend(output)
+    for candidate in candidates:
+        shape = getattr(candidate, "shape", None)
+        ndim = getattr(candidate, "ndim", None)
+        if (
+            callable(getattr(candidate, "norm", None))
+            and ndim == 2
+            and shape is not None
+            and int(shape[-1]) == expected_dimension
+        ):
+            return candidate
+    raise TypeError(
+        f"CLIP {modality} feature output {type(output).__name__} does not contain "
+        f"a 2-D projected tensor with dimension {expected_dimension}"
+    )
+
+
 class MultimodalRAGRetriever:
     """BGE text retrieval plus CLIP image retrieval and rank-based fusion."""
 
@@ -230,7 +255,12 @@ class MultimodalRAGRetriever:
                 inputs = self.clip_processor(images=images, return_tensors="pt", padding=True)
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
                 with self.torch.no_grad():
-                    features = self.clip_model.get_image_features(**inputs)
+                    raw_features = self.clip_model.get_image_features(**inputs)
+                features = _clip_feature_tensor(
+                    raw_features,
+                    expected_dimension=int(self.image_index.d),
+                    modality="image",
+                )
                 features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
                 vector = features.mean(dim=0, keepdim=True)
                 vector = vector / vector.norm(dim=-1, keepdim=True).clamp(min=1e-12)
@@ -238,7 +268,12 @@ class MultimodalRAGRetriever:
             inputs = self.clip_processor(text=[query[:2000]], return_tensors="pt", padding=True, truncation=True)
             inputs = {key: value.to(self.device) for key, value in inputs.items()}
             with self.torch.no_grad():
-                features = self.clip_model.get_text_features(**inputs)
+                raw_features = self.clip_model.get_text_features(**inputs)
+            features = _clip_feature_tensor(
+                raw_features,
+                expected_dimension=int(self.image_index.d),
+                modality="text",
+            )
             features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-12)
             return features.cpu().numpy().astype("float32"), 0
         finally:

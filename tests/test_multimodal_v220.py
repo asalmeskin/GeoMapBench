@@ -6,7 +6,34 @@ from pathlib import Path
 from PIL import Image
 
 from geomapbench_eval.prompts import build_messages
-from geomapbench_eval.rag import RAG_APPLICABLE_LEAVES, stage_corpus
+from geomapbench_eval.rag import RAG_APPLICABLE_LEAVES, _clip_feature_tensor, stage_corpus
+
+
+class _FakeTensor:
+    ndim = 2
+
+    def __init__(self, dimension: int):
+        self.shape = (2, dimension)
+
+    def norm(self, *args, **kwargs):
+        raise AssertionError("Extraction should not call norm")
+
+
+class _FakeModelOutput:
+    def __init__(self, dimension: int):
+        self.pooler_output = _FakeTensor(dimension)
+
+
+def test_clip_feature_extraction_supports_tensor_and_model_output() -> None:
+    legacy = _FakeTensor(512)
+    modern = _FakeModelOutput(512)
+
+    assert _clip_feature_tensor(
+        legacy, expected_dimension=512, modality="image"
+    ) is legacy
+    assert _clip_feature_tensor(
+        modern, expected_dimension=512, modality="image"
+    ) is modern.pooler_output
 
 
 def test_stage_corpus_includes_both_indexes(tmp_path: Path) -> None:
