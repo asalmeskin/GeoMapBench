@@ -252,9 +252,15 @@ def analyze(
 def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     """Paired, protocol-locked comparison using task-aware and strict scores."""
     fairness_fields = (
-        "model", "temperature", "max_tokens", "reasoning_effort", "reasoning_enabled", "top_k",
+        "model", "temperature", "max_tokens", "reasoning_effort", "reasoning_enabled",
         "include_images", "per_leaf_limit", "limit", "target_record_count",
-        "selected_ids_hash", "selected_records_hash", "protocol", "benchmark_content_hash",
+        "selected_ids_hash", "selected_records_hash", "benchmark_content_hash",
+    )
+
+    semantic_protocol_fields = (
+        "evaluation_protocol_revision", "prompt_revision", "scoring_revision",
+        "task_metric_revision", "artifact_protocol_revision", "image_converter_revision",
+        "canonical_loader",
     )
 
     def run_config(path: Path) -> dict[str, Any]:
@@ -268,6 +274,21 @@ def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
         f"{field}: {first_config.get(field)!r} != {second_config.get(field)!r}"
         for field in fairness_fields if first_config.get(field) != second_config.get(field)
     ]
+    first_protocol = first_config.get("protocol") or {}
+    second_protocol = second_config.get("protocol") or {}
+    mismatches.extend(
+        f"protocol.{field}: {first_protocol.get(field)!r} != {second_protocol.get(field)!r}"
+        for field in semantic_protocol_fields
+        if first_protocol.get(field) != second_protocol.get(field)
+    )
+    first_condition = str(first_config.get("condition") or "")
+    second_condition = str(second_config.get("condition") or "")
+    if "rag" in first_condition and "rag" in second_condition:
+        if first_config.get("retrieval_config") != second_config.get("retrieval_config"):
+            mismatches.append(
+                f"retrieval_config: {first_config.get('retrieval_config')!r} != "
+                f"{second_config.get('retrieval_config')!r}"
+            )
     if mismatches:
         raise ValueError("Runs are not evaluation-protocol compatible; comparison refused.\n - " + "\n - ".join(mismatches))
 
@@ -276,6 +297,10 @@ def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
     # task-aware scores; this performs no API/model calls.
     first_benchmark = Path(str(first_config["benchmark_root"])).expanduser().resolve()
     second_benchmark = Path(str(second_config["benchmark_root"])).expanduser().resolve()
+    if not first_benchmark.is_dir() and second_benchmark.is_dir():
+        first_benchmark = second_benchmark
+    if not second_benchmark.is_dir() and first_benchmark.is_dir():
+        second_benchmark = first_benchmark
     rescore_in_place(base_path, first_benchmark)
     rescore_in_place(rag_path, second_benchmark)
 

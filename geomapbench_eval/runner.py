@@ -26,7 +26,15 @@ class Retriever(Protocol):
     last_trace: dict[str, Any]
     last_usage: dict[str, Any]
 
-    def search(self, query: str, leaf: str, top_k: int) -> list[dict[str, Any]]: ...
+    def search(
+        self,
+        query: str,
+        leaf: str,
+        top_k: int,
+        *,
+        record: dict[str, Any],
+        task_dir: Path,
+    ) -> list[dict[str, Any]]: ...
 
 
 def _rows(path: Path) -> list[dict[str, Any]]:
@@ -146,7 +154,9 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
     state_path = output_root / "run_state.json"
     inflight_path = output_root / "inflight.json"
     condition = str(args.condition)
-    if condition in {"base_rag", "agentic_rag"} and retriever is None:
+    if condition in {
+        "base_rag", "agentic_rag", "multimodal_rag", "agentic_multimodal_rag",
+    } and retriever is None:
         raise ValueError(f"condition={condition} requires a retriever")
 
     temperature = getattr(args, "temperature", 0.0)
@@ -166,7 +176,7 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
     )
     identity = experiment_identity(args)
     run_config = {
-        "format": "GeoMapBench OpenRouter final task-aware evaluation v2.1",
+        "format": "GeoMapBench OpenRouter final task-aware evaluation v2.2",
         "created_at": utc_now(),
         "model": args.model,
         "condition": condition,
@@ -187,6 +197,7 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
         "selected_ids": identity["selected_ids"],
         "protocol": protocol_descriptor(),
         "benchmark_content_hash": getattr(args, "benchmark_content_hash", None),
+        "retrieval_config": getattr(args, "retrieval_config", None),
     }
     config_path = output_root / "run_config.json"
     if config_path.exists() and not args.force:
@@ -197,8 +208,9 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
                 raise ValueError("Cumulative output cannot shrink or replace previously selected IDs")
             comparable = {
                 "model", "condition", "temperature", "max_tokens",
-                "reasoning_effort", "reasoning_enabled", "benchmark_root", "top_k",
+                "reasoning_effort", "reasoning_enabled", "top_k",
                 "include_images", "protocol", "benchmark_content_hash", "cumulative",
+                "retrieval_config",
             }
         else:
             comparable = set(run_config) - {"created_at"}
@@ -298,7 +310,13 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
                 cost_total=total_spent,
             )
             if retriever is not None:
-                contexts = retriever.search(_query(record), str(record.get("leaf", "")), args.top_k)
+                contexts = retriever.search(
+                    _query(record),
+                    str(record.get("leaf", "")),
+                    args.top_k,
+                    record=record,
+                    task_dir=task_dir,
+                )
                 retrieval_usage = dict(getattr(retriever, "last_usage", {}) or {})
                 retrieval_cost += float(retrieval_usage.get("cost") or 0.0)
                 if getattr(retriever, "last_trace", None):
@@ -506,7 +524,14 @@ def add_run_parser(sub: argparse._SubParsersAction[Any]) -> None:
     parser.add_argument("--benchmark-root", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--condition", choices=("base", "base_rag", "agentic_rag"), default="base")
+    parser.add_argument(
+        "--condition",
+        choices=(
+            "base", "base_rag", "agentic_rag",
+            "multimodal_rag", "agentic_multimodal_rag",
+        ),
+        default="base",
+    )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=16384)
@@ -532,7 +557,7 @@ def add_run_parser(sub: argparse._SubParsersAction[Any]) -> None:
 
 def validate_run_args(args: argparse.Namespace) -> None:
     if args.condition != "base":
-        raise ValueError("Use `rag-suite` for base_rag and agentic_rag so dense retrieval is initialized safely")
+        raise ValueError("Use `rag-suite` for RAG conditions so multimodal retrieval is validated and initialized safely")
     if args.per_leaf_limit is not None and args.per_leaf_limit < 1:
         raise ValueError("--per-leaf-limit must be at least 1")
     if args.max_tokens < 1024:

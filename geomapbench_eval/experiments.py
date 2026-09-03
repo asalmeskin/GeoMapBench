@@ -10,12 +10,16 @@ from typing import Any
 
 from .analysis import analyze, compare
 from .benchmark import canonical_benchmark_records
-from .common import atomic_json
+from .common import atomic_json, read_jsonl
 from .cumulative import migrate_legacy_base_outputs, write_cohort_manifest
 from .openrouter import OpenRouterClient
 from .plots import benchmark_plots, rag_plots
 from .preflight import benchmark_preflight
-from .rag import AgenticRAGRetriever, DenseRAGRetriever, stage_corpus
+from .rag import (
+    AgenticMultimodalRAGRetriever,
+    MultimodalRAGRetriever,
+    stage_corpus,
+)
 from .runner import run
 
 
@@ -79,6 +83,15 @@ def _run_namespace(
         no_clean=False,
         force=False,
         benchmark_content_hash=getattr(args, "benchmark_content_hash", None),
+        retrieval_config={
+            "candidate_k": getattr(args, "candidate_k", None),
+            "image_candidate_k": getattr(args, "image_candidate_k", None),
+            "top_k": getattr(args, "top_k", 5),
+            "max_reference_images": getattr(args, "max_reference_images", None),
+            "max_passage_chars": getattr(args, "max_passage_chars", None),
+            "max_context_chars": getattr(args, "max_context_chars", None),
+            "rerank": not bool(getattr(args, "no_rerank", False)),
+        } if "rag" in condition else None,
     )
 
 
@@ -88,6 +101,57 @@ def _preflight(args: argparse.Namespace) -> dict[str, Any]:
         Path(args.benchmark_root), cache_root=cache,
         force=args.force_preflight, max_image_bytes=8_000_000,
     )
+
+
+def _trusted_benchmark_report(args: argparse.Namespace) -> dict[str, Any]:
+    """Reuse a previously passed benchmark preflight without rescanning assets."""
+    path = Path(args.benchmark_report).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Trusted benchmark report not found: {path}. The multimodal RAG suite will not "
+            "start paid evaluation without an existing passed report."
+        )
+    report = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "status": "pass",
+        "record_count": 2300,
+        "leaf_count": 23,
+    }
+    mismatches = {
+        key: {"expected": expected, "found": report.get(key)}
+        for key, expected in required.items() if report.get(key) != expected
+    }
+    if mismatches or not str(report.get("portable_benchmark_hash") or ""):
+        raise ValueError(
+            "Trusted benchmark report is invalid: "
+            + json.dumps({"mismatches": mismatches, "portable_benchmark_hash": report.get("portable_benchmark_hash")})
+        )
+    print(
+        "[rag-suite] trusted benchmark report accepted; repeated 1,662-asset transport preflight is disabled",
+        flush=True,
+    )
+    return {**report, "cache_hit": True, "reused_without_rescan": True, "cache_path": str(path)}
+
+
+def _modality_audit(path: Path) -> dict[str, Any]:
+    latest = {
+        str(row.get("id")): row
+        for row in (read_jsonl(path) if path.is_file() else [])
+        if row.get("id")
+    }
+    report = {
+        "unique_traces": len(latest),
+        "text_index_used": sum(bool(row.get("text_index_used")) for row in latest.values()),
+        "image_index_used": sum(bool(row.get("image_index_used")) for row in latest.values()),
+        "benchmark_image_queries": sum(int(row.get("benchmark_image_count") or 0) > 0 for row in latest.values()),
+        "retrieved_images_attached": sum(int(row.get("reference_images") or 0) for row in latest.values()),
+        "abstentions": sum(bool(row.get("abstained")) for row in latest.values()),
+    }
+    report["both_modalities_observed"] = bool(
+        report["text_index_used"] and report["image_index_used"]
+        and report["benchmark_image_queries"] and report["retrieved_images_attached"]
+    )
+    return report
 
 
 def _cumulative_target(
@@ -305,23 +369,54 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
     output = Path(args.output).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     print(f"[rag-suite] output: {output}", flush=True)
+    legacy_children = [
+        name for name in ("base_rag", "agentic_rag")
+        if (output / name).exists()
+    ]
+    if legacy_children:
+        raise ValueError(
+            "Refusing to mix the v2.2 multimodal protocol with legacy text-only condition "
+            f"directories: {legacy_children}. Keep those folders as an ablation and use the "
+            "new isolated output name from the v2.2 notebook."
+        )
     requested = [value.strip() for value in args.conditions.split(",") if value.strip()]
-    allowed = {"base_rag", "agentic_rag"}
+    allowed = {"multimodal_rag", "agentic_multimodal_rag"}
     if not requested or set(requested) - allowed:
         raise ValueError(f"--conditions must be a comma-separated subset of {sorted(allowed)}")
+    requested = [
+        condition for condition in ("multimodal_rag", "agentic_multimodal_rag")
+        if condition in requested
+    ]
     model_row = _model_row(Path(args.models), args.model)
     agent_row = _model_row(Path(args.models), args.agent_model)
-    catalog_problems = _catalog_check([model_row, agent_row])
-    if catalog_problems:
-        raise ValueError(f"RAG model catalog validation failed: {catalog_problems}")
     max_tokens = int(model_row.get("max_tokens", 16384))
     reasoning_effort = model_row.get("reasoning_effort")
     reasoning_enabled = bool(model_row.get("reasoning_enabled", False))
     temperature = model_row.get("temperature", 0.0)
-    preflight = _preflight(args)
-    args.benchmark_content_hash = preflight["portable_benchmark_hash"]
-    _, cohort = _cumulative_target(args, output=output, preflight=preflight)
+    benchmark_report = _trusted_benchmark_report(args)
+    args.benchmark_content_hash = benchmark_report["portable_benchmark_hash"]
+    _, cohort = _cumulative_target(args, output=output, preflight=benchmark_report)
     local_corpus = stage_corpus(Path(args.corpus_root), Path(args.work_root) / "corpus")
+    validation_retriever = MultimodalRAGRetriever(
+        local_corpus,
+        media_root=Path(args.corpus_root),
+        candidate_k=args.candidate_k,
+        image_candidate_k=args.image_candidate_k,
+        max_reference_images=args.max_reference_images,
+        rerank=not args.no_rerank,
+        max_passage_chars=args.max_passage_chars,
+        max_context_chars=args.max_context_chars,
+    )
+    multimodal_validation = validation_retriever.validate_runtime(Path(args.benchmark_root))
+    atomic_json(output / "multimodal_validation.json", multimodal_validation)
+    # Do not contact OpenRouter, even for its free catalog endpoint, until the
+    # local text+image retrieval and final prompt transport have passed.
+    catalog_problems = _catalog_check([model_row, agent_row])
+    if catalog_problems:
+        raise ValueError(f"RAG model catalog validation failed: {catalog_problems}")
+    if "multimodal_rag" not in requested:
+        del validation_retriever
+        validation_retriever = None
     reports: dict[str, Any] = {}
     for condition in requested:
         run_output = output / condition
@@ -331,16 +426,16 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
             reasoning_enabled=reasoning_enabled, temperature=temperature,
         )
         retriever = None
-        if condition == "base_rag":
-            retriever = DenseRAGRetriever(
-                local_corpus, candidate_k=args.candidate_k, rerank=not args.no_rerank,
-                max_passage_chars=args.max_passage_chars,
-                max_context_chars=args.max_context_chars,
-            )
-        elif condition == "agentic_rag":
-            retriever = AgenticRAGRetriever(
+        if condition == "multimodal_rag":
+            retriever = validation_retriever
+            validation_retriever = None
+        elif condition == "agentic_multimodal_rag":
+            retriever = AgenticMultimodalRAGRetriever(
                 local_corpus,
+                media_root=Path(args.corpus_root),
                 candidate_k=args.candidate_k,
+                image_candidate_k=args.image_candidate_k,
+                max_reference_images=args.max_reference_images,
                 rerank=not args.no_rerank,
                 max_passage_chars=args.max_passage_chars,
                 max_context_chars=args.max_context_chars,
@@ -359,37 +454,55 @@ def run_rag_suite(args: argparse.Namespace) -> dict[str, Any]:
                 run_output / "responses.jsonl", run_output / "analysis",
                 benchmark_root=Path(args.benchmark_root),
             ),
+            "modality_audit": _modality_audit(run_output / "retrieval_trace.jsonl"),
         }
         print(f"[rag-suite] DONE {condition}", flush=True)
         del retriever
     comparisons: dict[str, Any] = {}
-    if {"base_rag", "agentic_rag"}.issubset(requested) and all(
-        bool(reports[item]["run"].get("complete")) for item in ("base_rag", "agentic_rag")
+    if {"multimodal_rag", "agentic_multimodal_rag"}.issubset(requested) and all(
+        bool(reports[item]["run"].get("complete"))
+        for item in ("multimodal_rag", "agentic_multimodal_rag")
     ):
         try:
-            comparisons["base_rag_to_agentic_rag"] = compare(
-                output / "base_rag" / "responses.jsonl",
-                output / "agentic_rag" / "responses.jsonl",
-                output / "comparisons" / "base_rag_to_agentic_rag",
+            comparisons["multimodal_to_agentic_multimodal"] = compare(
+                output / "multimodal_rag" / "responses.jsonl",
+                output / "agentic_multimodal_rag" / "responses.jsonl",
+                output / "comparisons" / "multimodal_to_agentic_multimodal",
             )
         except ValueError as error:
-            comparisons["base_rag_to_agentic_rag"] = {
+            comparisons["multimodal_to_agentic_multimodal"] = {
                 "protocol_validation": "deferred",
                 "reason": str(error),
             }
             print(f"[rag-suite] comparison deferred: {error}", flush=True)
-    elif {"base_rag", "agentic_rag"}.issubset(requested):
-        comparisons["base_rag_to_agentic_rag"] = {
+    elif {"multimodal_rag", "agentic_multimodal_rag"}.issubset(requested):
+        comparisons["multimodal_to_agentic_multimodal"] = {
             "protocol_validation": "deferred",
             "reason": "Both conditions must reach their exact target record count; rerun the same cell to resume.",
         }
+    base_results = Path(args.base_results).expanduser().resolve() if args.base_results else None
+    if base_results and base_results.is_file():
+        for condition in requested:
+            if not bool(reports[condition]["run"].get("complete")):
+                continue
+            key = f"base_to_{condition}"
+            try:
+                comparisons[key] = compare(
+                    base_results,
+                    output / condition / "responses.jsonl",
+                    output / "comparisons" / key,
+                )
+            except ValueError as error:
+                comparisons[key] = {"protocol_validation": "deferred", "reason": str(error)}
+                print(f"[rag-suite] base comparison deferred: {error}", flush=True)
     plot_files = rag_plots(
         output,
         {condition: value["analysis"] for condition, value in reports.items()},
-        comparisons.get("base_rag_to_agentic_rag"),
+        comparisons.get("multimodal_to_agentic_multimodal"),
     )
     result = {
-        "preflight": preflight,
+        "benchmark_report": benchmark_report,
+        "multimodal_validation": multimodal_validation,
         "cohort": cohort,
         "model_config": model_row,
         "reports": reports,
@@ -431,16 +544,25 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     suite.add_argument("--retry-max-seconds", type=float, default=60.0)
     suite.add_argument("--max-consecutive-errors", type=int, default=2)
 
-    rag = sub.add_parser("rag-suite", help="Run dense base_rag and agentic_rag independently; comparisons are protocol-locked later.")
+    rag = sub.add_parser(
+        "rag-suite",
+        help="Run validated BGE+CLIP multimodal and agentic-multimodal RAG conditions.",
+    )
     rag.add_argument("--benchmark-root", required=True)
     rag.add_argument("--corpus-root", required=True)
     rag.add_argument("--work-root", required=True)
     rag.add_argument("--output", required=True)
     rag.add_argument("--models", required=True, help="The exact model matrix used by the Evaluation notebook")
-    rag.add_argument("--preflight-cache")
-    rag.add_argument("--force-preflight", action="store_true")
+    rag.add_argument(
+        "--benchmark-report", required=True,
+        help="Existing passed benchmark_preflight.json; it is trusted without rescanning assets",
+    )
     rag.add_argument("--model", required=True)
-    rag.add_argument("--conditions", default="base_rag,agentic_rag")
+    rag.add_argument(
+        "--base-results",
+        help="Optional completed base responses.jsonl for zero-API paired comparisons",
+    )
+    rag.add_argument("--conditions", default="multimodal_rag,agentic_multimodal_rag")
     rag.add_argument("--per-leaf-limit", type=int)
     rag.add_argument(
         "--target-per-leaf", type=int, default=1,
@@ -456,6 +578,8 @@ def add_experiment_parsers(sub: argparse._SubParsersAction[Any]) -> None:
     rag.add_argument("--max-consecutive-errors", type=int, default=2)
     rag.add_argument("--top-k", type=int, default=5)
     rag.add_argument("--candidate-k", type=int, default=40)
+    rag.add_argument("--image-candidate-k", type=int, default=20)
+    rag.add_argument("--max-reference-images", type=int, default=1)
     rag.add_argument("--max-passage-chars", type=int, default=1500)
     rag.add_argument("--max-context-chars", type=int, default=6000)
     rag.add_argument("--no-rerank", action="store_true")

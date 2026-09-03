@@ -120,7 +120,7 @@ def benchmark_plots(output: Path, model_rows: list[dict[str, Any]]) -> list[str]
 
 
 def rag_plots(output: Path, analyses: dict[str, dict[str, Any]], comparison: dict[str, Any] | None) -> list[str]:
-    """Create matched Base-RAG/Agentic-RAG paper figures."""
+    """Create matched multimodal/agentic-multimodal paper figures."""
     _theme()
     plot_root = output / "plots"
     plot_root.mkdir(parents=True, exist_ok=True)
@@ -157,7 +157,7 @@ def rag_plots(output: Path, analyses: dict[str, dict[str, Any]], comparison: dic
         colors = ["#D64B4B" if value < 0 else "#2EAD4A" for value in frame["Delta"]]
         sns.barplot(data=frame, y="Task", x="Delta", palette=colors, hue="Task", legend=False, ax=axis)
         axis.axvline(0, color="black", linewidth=1)
-        axis.set(xlabel="Agentic RAG − Base RAG (percentage points)", ylabel="Task")
+        axis.set(xlabel="Agentic multimodal − multimodal (percentage points)", ylabel="Task")
         _bold(axis)
         created.append(_save(fig, plot_root / "rag_task_delta.png", bottom=.04))
     if bloom_rows:

@@ -107,7 +107,7 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 version = subprocess.check_output(
     [sys.executable, "-c", "import geomapbench_eval; print(geomapbench_eval.__version__)"], text=True,
 ).strip()
-assert version == "2.1.0", f"Expected GeoMapBench 2.1.0, installed {version}"
+assert version == "2.2.0", f"Expected GeoMapBench 2.2.0, installed {version}"
 print("Installed final release:", version)
 '''
 
@@ -235,11 +235,13 @@ EVALUATION = notebook([
 
 RAG = notebook([
     markdown("""
-    # GeoMapBench — final Claude RAG evaluation
+    # GeoMapBench — validated multimodal RAG evaluation
 
-    This independent notebook runs only `base_rag` and `agentic_rag`, both with Claude Sonnet 5 as the answer model. BM25 is absent. Gemini Flash-Lite is used only for planning/judging in the agentic condition. It does not require the benchmark notebook to have run and can execute simultaneously on another computer.
+    This notebook runs two new conditions: `multimodal_rag` and `agentic_multimodal_rag`. Both use BGE text retrieval, the existing CLIP image index, benchmark-image-to-corpus-image retrieval, rank fusion, optional retrieved reference images, and a predeclared 14-task coverage gate. BM25 is absent.
 
-    Both conditions use the same deterministic cohort, answer prompt, model parameters, scoring protocol, and artifact contract. Logs, response cache, agent cache, retrieval traces, in-flight state and converted images all resume safely.
+    The paid answer evaluation cannot start until a runtime validation proves that both the 180,344-record text index and the 1,794-image CLIP index are loaded, a benchmark image is encoded, both searches return results, fusion succeeds, and retrieved corpus image files are accessible. The old 1,662-asset benchmark preflight is not rerun; its already-passed report is trusted for the portable benchmark hash.
+
+    Old text-only RAG results are preserved as an ablation and are never imported into this new output. Re-running the execution cell resumes only the v2.2 multimodal conditions.
     """),
     code(r'''
     # EDIT ONLY THIS CELL
@@ -254,18 +256,33 @@ RAG = notebook([
     ANSWER_MODEL = "anthropic/claude-sonnet-5"
     AGENT_MODEL = "google/gemini-3.5-flash-lite"
     TARGET_PER_LEAF = 1  # smoke: 1; then increase in-place to 6, 50, or 100
-    MAX_COST_USD_PER_CONDITION = 75.0
+    MAX_COST_USD_PER_CONDITION = 30.0
     REQUEST_DELAY_SECONDS = 1.0
     PROGRESS_EVERY = 5
-    FORCE_PREFLIGHT = False
 
-    FINAL_OUTPUT_NAME = "rag_suite_final"
+    FINAL_OUTPUT_NAME = "rag_suite_multimodal_claude_v220"
+    TRUSTED_BENCHMARK_REPORT = f"{CACHE_ROOT}/preflight_final/benchmark_preflight.json"
+    BASE_RESULTS = f"{RESULTS_ROOT}/model_suite_final/anthropic_claude-sonnet-5/responses.jsonl"
     INSTALL_RAG = True
     '''),
     code(SETUP + r'''
 assert Path(CORPUS_ROOT).is_dir(), f"RAG corpus not found: {CORPUS_ROOT}"
-for relative in ("indexes/text.faiss", "indexes/text_metadata.jsonl"):
-    assert (Path(CORPUS_ROOT) / relative).is_file(), f"Missing dense artifact: {relative}"
+for relative in (
+    "indexes/text.faiss", "indexes/text_metadata.jsonl", "indexes/text_manifest.json",
+    "indexes/image.faiss", "indexes/image_metadata.jsonl", "indexes/image_manifest.json",
+):
+    assert (Path(CORPUS_ROOT) / relative).is_file(), f"Missing multimodal artifact: {relative}"
+assert Path(TRUSTED_BENCHMARK_REPORT).is_file(), (
+    "The already-passed benchmark report is missing: " + TRUSTED_BENCHMARK_REPORT
+)
+old_text_only_outputs = [
+    Path(RESULTS_ROOT) / "rag_suite_final_gpt",
+    Path(RESULTS_ROOT) / "rag_suite_final",
+]
+for old_text_only in old_text_only_outputs:
+    if old_text_only.exists():
+        print("Preserving text-only ablation (not imported):", old_text_only)
+print("New isolated multimodal output:", Path(RESULTS_ROOT) / FINAL_OUTPUT_NAME)
 '''),
     code(API_KEY),
     code(r'''
@@ -277,27 +294,28 @@ for relative in ("indexes/text.faiss", "indexes/text_metadata.jsonl"):
     command = [
         sys.executable, "-u", "-m", "geomapbench_eval", "rag-suite",
         "--benchmark-root", BENCHMARK_ROOT, "--corpus-root", CORPUS_ROOT,
-        "--work-root", "/content/geomaprag_work_final",
+        "--work-root", "/content/geomaprag_multimodal_work_v220",
         "--output", str(output), "--target-per-leaf", str(TARGET_PER_LEAF),
         "--models", str(repo / "config/evaluation_models_final.json"),
-        "--preflight-cache", str(Path(CACHE_ROOT) / "preflight_final"),
-        "--agent-cache", str(Path(CACHE_ROOT) / "agent_cache_final"),
+        "--benchmark-report", TRUSTED_BENCHMARK_REPORT,
+        "--agent-cache", str(Path(CACHE_ROOT) / "agent_cache_multimodal_v220"),
         "--model", ANSWER_MODEL, "--agent-model", AGENT_MODEL,
         "--agent-reasoning-effort", "minimal",
-        "--conditions", "base_rag,agentic_rag",
+        "--conditions", "multimodal_rag,agentic_multimodal_rag",
         "--max-cost-usd-per-model", str(MAX_COST_USD_PER_CONDITION),
-        "--top-k", "5", "--candidate-k", "40",
-        "--max-passage-chars", "1500", "--max-context-chars", "6000",
+        "--top-k", "3", "--candidate-k", "40", "--image-candidate-k", "20",
+        "--max-reference-images", "1",
+        "--max-passage-chars", "1200", "--max-context-chars", "3000",
         "--request-delay-seconds", str(REQUEST_DELAY_SECONDS),
         "--progress-every", str(PROGRESS_EVERY),
         "--timeout-seconds", "240", "--retries", "6",
         "--retry-base-seconds", "5", "--retry-max-seconds", "60",
         "--max-consecutive-errors", "2",
     ]
-    if FORCE_PREFLIGHT:
-        command += ["--force-preflight"]
+    if Path(BASE_RESULTS).is_file():
+        command += ["--base-results", BASE_RESULTS]
     run_live(command, cwd=repo)
-    print("Canonical final RAG suite:", output)
+    print("Canonical multimodal RAG suite:", output)
     '''),
     code(r'''
     # Matched conditions, paired comparison and Seaborn figures.
@@ -320,12 +338,21 @@ for relative in ("indexes/text.faiss", "indexes/text_metadata.jsonl"):
     if comparisons:
         display(pd.DataFrame([{"comparison": key, **value} for key, value in comparisons.items()]))
     print("Cohort:", {key: summary["cohort"][key] for key in ("target_per_leaf", "target_record_count", "selected_ids_hash")})
-    print("Preflight cache hit:", summary["preflight"].get("cache_hit"))
+    print("Trusted benchmark report reused:", summary["benchmark_report"].get("reused_without_rescan"))
+    print("Multimodal runtime validation:", summary["multimodal_validation"])
+    audits = {
+        condition: report.get("modality_audit", {})
+        for condition, report in summary["reports"].items()
+    }
+    display(pd.DataFrame([{"condition": key, **value} for key, value in audits.items()]))
+    for condition, audit in audits.items():
+        if summary["reports"][condition]["run"].get("completed_total", 0):
+            assert audit.get("both_modalities_observed"), f"Modality audit failed: {condition}"
     for name in summary.get("plots", []):
         display(Image(filename=str(output / "plots" / name)))
     '''),
     markdown("""
-    Start with `TARGET_PER_LEAF=1`. If both conditions complete, increase the same value in the same output directory. Each larger cohort contains all earlier IDs, so prior calls are reused. The final Base-RAG versus Agentic-RAG comparison is generated only when both sides contain exactly the same IDs under the same frozen protocol.
+    Start with `TARGET_PER_LEAF=1`. Confirm the explicit `[rag-validation] PASS` line and the modality-audit table, then increase the same value to 50 in the same output directory. Each larger cohort contains all earlier IDs, so prior calls are reused. Do not rename the output and do not copy files from any earlier `rag_suite_final*` directory; those are text-only ablations.
     """),
 ])
 

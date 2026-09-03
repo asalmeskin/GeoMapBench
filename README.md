@@ -1,11 +1,21 @@
 # GeoMapBench taxonomy data kit
 
-## Final cumulative evaluation workflow (v2.1.0)
+## Final cumulative evaluation workflow (v2.2.0)
 
 The final release includes two orchestration-only Colab notebooks:
 
 - `notebooks/GeoMapBench_Evaluation_Final.ipynb`: six multimodal models from six independent companies, including the economical Llama 4 Scout baseline; Muse is removed.
-- `notebooks/GeoMapBench_RAG_Final.ipynb`: independent Claude dense `base_rag` and `agentic_rag` runs.
+- `notebooks/GeoMapBench_RAG_Final.ipynb`: isolated Claude `multimodal_rag` and `agentic_multimodal_rag` runs using both corpus text and corpus images.
+
+Version 2.2 corrects the earlier text-only retrieval path. Every applicable RAG
+query searches the frozen 180,344-vector BGE text index and the frozen
+1,794-vector CLIP image index. Original benchmark images form the CLIP query;
+retrieved corpus images are encoded and sent to the answer model alongside
+retrieved text. A zero-API runtime validator checks both indexes, both query
+paths, corpus-image accessibility, fusion, final image encoding, and the
+fallback instruction before paid evaluation can start. The RAG notebook does
+not repeat the benchmark asset preflight; it reads the already-passed report
+only to lock the benchmark cohort/hash.
 
 Version 2.1 adds offline task-aware rescoring and publication figures. Existing
 raw responses are migrated into `model_suite_final` and rescored without API
@@ -14,9 +24,12 @@ for a filename rather than a measurable prediction. Those rows alone receive a
 new inline RLE-mask or graph-JSON prompt. Invalid JSON and genuine token-limit
 failures remain final failures and are never selectively retried.
 
-The RAG pipeline is dense-only. It uses the corpus `text.faiss` index built with
-`BAAI/bge-small-en-v1.5`, optionally reranks candidates with
-`BAAI/bge-reranker-base`, and does not use BM25.
+The RAG pipeline uses BGE text retrieval, CLIP image retrieval, rank fusion and
+optional `BAAI/bge-reranker-base` text reranking. It does not use BM25. On
+leaves outside the predeclared corpus-coverage set, retrieval abstains rather
+than injecting unrelated evidence. The prompt also tells the answer model to
+ignore unhelpful retrieved evidence and use the original images and its own
+knowledge.
 
 Both suites default to a 16,384-token output budget. Reasoning is disabled for
 models where the current catalog permits it and set to the minimum/low supported
@@ -352,17 +365,19 @@ geomapbench-eval suite `
   --legacy-output results\model_suite_cumulative_v7 `
   --delete-legacy-after-success
 
-# Independent dense-only RAG pilot. It needs no Base/Evaluation output.
+# Independent validated text+image RAG pilot. Base results are optional and
+# are used only for offline paired analysis, never as an execution dependency.
 geomapbench-eval rag-suite `
   --benchmark-root C:\data\geomapbench_100 `
   --corpus-root C:\data\GeoMapRAG_Corpus `
   --work-root C:\temp\geomaprag `
-  --output results\rag_suite_final `
+  --output results\rag_suite_multimodal_claude_v220 `
   --models config\evaluation_models_final.json `
   --model anthropic/claude-sonnet-5 `
-  --agent-cache cache\agent_v191 `
-  --preflight-cache cache\preflight `
-  --conditions base_rag,agentic_rag `
+  --agent-model google/gemini-3.5-flash-lite `
+  --agent-cache cache\agent_cache_multimodal_v220 `
+  --benchmark-report cache\preflight\benchmark_preflight.json `
+  --conditions multimodal_rag,agentic_multimodal_rag `
   --target-per-leaf 6
 
 geomapbench-eval analyze `
@@ -373,15 +388,16 @@ geomapbench-eval analyze `
 # Later, after transferring the independently completed folders to one machine:
 geomapbench-eval compare `
   --base-results results\model_suite_final\anthropic_claude-sonnet-5\responses.jsonl `
-  --rag-results results\rag_suite_final\agentic_rag\responses.jsonl `
+  --rag-results results\rag_suite_multimodal_claude_v220\agentic_multimodal_rag\responses.jsonl `
   --output results\claude_agentic_comparison
 ```
 
 The analysis command writes `per_leaf.csv`, `task_metrics_long.csv`, and
 `summary.json`. Suite commands additionally write publication-ready Seaborn
-plots as both 300-DPI PNG and vector PDF. The final RAG conditions use BGE dense retrieval and
-cross-encoder reranking; `agentic_rag` adds a cached planner/judge loop. BM25 is
-not used. Inspect retrieved IDs and retrieval metrics before attributing answer
+plots as both 300-DPI PNG and vector PDF. The final RAG conditions use BGE text
+retrieval, CLIP image retrieval, rank fusion and cross-encoder reranking;
+`agentic_multimodal_rag` adds a cached planner/judge loop. BM25 is not used.
+Inspect retrieved IDs, attached reference images and retrieval metrics before attributing answer
 changes to RAG. The command
 writes a per-leaf CSV, macro averages, Bloom-level summary, format-failure
 rate, bootstrap confidence intervals, latency, and OpenRouter-reported cost.
