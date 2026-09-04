@@ -14,7 +14,9 @@ from geoagent.corpus_index import StructuredCorpusIndex, normalize_name
 from geoagent.driver import RunConfig, run_agentic
 from geoagent.pipeline import AgenticPipeline
 from geoagent.prompting import build_agent_messages
+from geoagent.retrieval import HybridMultimodalRetriever
 from geoagent.taskview import TaskView, assert_prompt_contract_matches
+from geoagent.validate import validate_runtime
 from geomapbench_eval.common import read_jsonl
 from geomapbench_eval.cumulative import write_cohort_manifest
 
@@ -361,6 +363,98 @@ def test_fusion_applies_capability_bonus_without_disturbing_others() -> None:
     assert boosted["a"]["capability_match"] is False
     assert round(boosted["b"]["fusion_score"] / plain["b"], 4) == 1.30
     assert boosted["a"]["fusion_score"] == plain["a"]
+
+
+def _bare_retriever(media_root: Path) -> HybridMultimodalRetriever:
+    """A HybridMultimodalRetriever with __init__ skipped, for probing internals
+    without FAISS/CLIP/a cross-encoder actually loaded."""
+    import types
+
+    retriever = HybridMultimodalRetriever.__new__(HybridMultimodalRetriever)
+    retriever.reranker = None
+    retriever.candidate_k = 10
+    retriever.image_candidate_k = 10
+    retriever.max_reference_images = 1
+    retriever.max_passage_chars = 900
+    retriever.max_context_chars = 3000
+    retriever.media_root = media_root
+    retriever.corpus_root = media_root
+    retriever.text_index = types.SimpleNamespace(ntotal=1)
+    retriever.image_index = types.SimpleNamespace(ntotal=1)
+    return retriever
+
+
+def test_validate_runtime_forces_an_accessible_image_hit_into_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The natural top-k hybrid shortlist is not guaranteed to keep any
+    # image-bearing candidate (MMR/capability boosting can legitimately push
+    # them all out), so the probe must force one in rather than trust ranking.
+    media_root = tmp_path / "corpus"
+    (media_root / "assets").mkdir(parents=True)
+    (media_root / "assets" / "pic.png").write_bytes(b"png")
+    text_record = {"id": "text:1", "input": {"title": "T",
+                                             "text": "A retrievable passage long enough to survive rendering."}}
+    image_record = {"id": "img:1", "input": {"title": "Pic", "text": "", "images": ["assets/pic.png"]}}
+
+    task_dir = tmp_path / "visual_geolocation"
+    (task_dir / "assets").mkdir(parents=True)
+    (task_dir / "assets" / "000.png").write_bytes(b"png")
+    record = {
+        "id": "visual_geolocation:000", "leaf": "visual_geolocation",
+        "input": {"images": ["assets/000.png"], "question": "Where is this?"},
+        "evaluation": {"type": "exact_match"},
+    }
+
+    retriever = _bare_retriever(media_root)
+    monkeypatch.setattr(retriever, "_dense", lambda query, k: [
+        {"record": text_record, "dense_score": 1.0, "dense_rank": 1},
+    ])
+    monkeypatch.setattr(retriever, "_image_hits", lambda image_paths, fallback_text: (
+        [{"record": image_record, "image_score": 0.9, "image_rank": 1}], len(image_paths),
+    ))
+
+    report = validate_runtime(retriever, None, [(task_dir, record)], top_k=2)
+    assert report["status"] == "pass"
+    assert report["retrieved_reference_images"] >= 1
+    assert report["prompt_image_parts"] > report["benchmark_image_count"]
+    assert report["fallback_sentence_present"] is True
+    # No applicable deterministic tool fires for this synthetic record (no
+    # structured_index, no matching payload fields), so the "Verified
+    # computations" block is correctly absent -- it is informational, not a
+    # pass/fail condition.
+    assert report["verified_block_present"] is False
+
+
+def test_validate_runtime_raises_when_no_image_hit_is_accessible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    media_root = tmp_path / "corpus"
+    media_root.mkdir(parents=True)
+    text_record = {"id": "text:1", "input": {"title": "T",
+                                             "text": "A retrievable passage long enough to survive rendering."}}
+    # References a file that does not exist under media_root.
+    missing_image_record = {"id": "img:1", "input": {"title": "Pic", "text": "", "images": ["assets/missing.png"]}}
+
+    task_dir = tmp_path / "visual_geolocation"
+    (task_dir / "assets").mkdir(parents=True)
+    (task_dir / "assets" / "000.png").write_bytes(b"png")
+    record = {
+        "id": "visual_geolocation:000", "leaf": "visual_geolocation",
+        "input": {"images": ["assets/000.png"], "question": "Where is this?"},
+        "evaluation": {"type": "exact_match"},
+    }
+
+    retriever = _bare_retriever(media_root)
+    monkeypatch.setattr(retriever, "_dense", lambda query, k: [
+        {"record": text_record, "dense_score": 1.0, "dense_rank": 1},
+    ])
+    monkeypatch.setattr(retriever, "_image_hits", lambda image_paths, fallback_text: (
+        [{"record": missing_image_record, "image_score": 0.9, "image_rank": 1}], len(image_paths),
+    ))
+
+    with pytest.raises(RuntimeError, match="inaccessible"):
+        validate_runtime(retriever, None, [(task_dir, record)], top_k=2)
 
 
 def test_mmr_breaks_up_near_duplicate_passages() -> None:
