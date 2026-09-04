@@ -16,9 +16,11 @@ from geoagent.pipeline import AgenticPipeline
 from geoagent.prompting import build_agent_messages
 from geoagent.retrieval import HybridMultimodalRetriever
 from geoagent.taskview import TaskView, assert_prompt_contract_matches
+from geoagent.suite import _already_scored_by_current_code
 from geoagent.validate import validate_runtime
-from geomapbench_eval.common import read_jsonl
+from geomapbench_eval.common import atomic_json, read_jsonl
 from geomapbench_eval.cumulative import write_cohort_manifest
+from geomapbench_eval.protocol import protocol_descriptor
 
 
 def _view(leaf, question, payload, choices=None, evaluation_type="exact_match"):
@@ -808,3 +810,132 @@ def test_driver_resumes_for_free_and_recovers_unparsable_answers(
     audit = toolbelt_audit(output / "geoagent_tool_rag" / "agent_trace.jsonl")
     assert audit["records"] == 2
     assert audit["records_with_exact_proposal"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Rescore avoidance: canonical_benchmark_records caching, skip_rescore plumbing
+# ---------------------------------------------------------------------------
+#
+# rescore_in_place (via analyze/compare) re-walks every row and, for mask/graph
+# leaves, reopens a gold asset per row -- real cost against a Drive-mounted
+# benchmark. These prove the caching and skip-rescore paths that avoid paying
+# that cost more than once per file within a single suite invocation.
+
+
+def _make_run_config(results_path: Path, *, protocol: dict, benchmark_root: Path) -> None:
+    atomic_json(results_path.parent / "run_config.json", {
+        "condition": "base", "benchmark_root": str(benchmark_root), "protocol": protocol,
+    })
+
+
+def test_already_scored_detects_a_matching_protocol(tmp_path: Path) -> None:
+    results = tmp_path / "responses.jsonl"
+    results.write_text(json.dumps({"id": "a", "status": "ok", "task_score": 0.8}) + "\n", encoding="utf-8")
+    _make_run_config(results, protocol=protocol_descriptor(), benchmark_root=tmp_path)
+    assert _already_scored_by_current_code(results) is True
+
+
+def test_already_scored_is_false_on_a_stale_protocol(tmp_path: Path) -> None:
+    results = tmp_path / "responses.jsonl"
+    results.write_text(json.dumps({"id": "a", "status": "ok", "task_score": 0.8}) + "\n", encoding="utf-8")
+    stale = {**protocol_descriptor(), "task_metric_revision": "some-old-revision"}
+    _make_run_config(results, protocol=stale, benchmark_root=tmp_path)
+    assert _already_scored_by_current_code(results) is False
+
+
+def test_already_scored_is_false_when_task_score_is_missing(tmp_path: Path) -> None:
+    # Exactly the shape of a freshly written geoagent row, which the driver
+    # never populates with task_score at write time -- rescoring is required.
+    results = tmp_path / "responses.jsonl"
+    results.write_text(json.dumps({"id": "a", "status": "ok", "response": "{}"}) + "\n", encoding="utf-8")
+    _make_run_config(results, protocol=protocol_descriptor(), benchmark_root=tmp_path)
+    assert _already_scored_by_current_code(results) is False
+
+
+def test_already_scored_is_false_without_a_run_config(tmp_path: Path) -> None:
+    results = tmp_path / "responses.jsonl"
+    results.write_text(json.dumps({"id": "a", "status": "ok", "task_score": 0.8}) + "\n", encoding="utf-8")
+    assert _already_scored_by_current_code(results) is False
+
+
+def _synthetic_benchmark(root: Path) -> None:
+    """A minimal 23-leaf, 100-record-per-leaf benchmark satisfying
+    canonical_benchmark_records' shape checks, for exercising its cache."""
+    from geomapbench_data.common import SEEDS
+
+    for leaf in SEEDS:
+        leaf_dir = root / leaf
+        leaf_dir.mkdir(parents=True)
+        rows = [{"id": f"{leaf}-{index:03d}", "leaf": leaf, "input": {"text": "x" * 40}} for index in range(100)]
+        with (leaf_dir / "data_clean.jsonl").open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+
+def test_canonical_benchmark_records_reads_disk_once_per_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from geomapbench_eval import benchmark as benchmark_module
+
+    benchmark_module._canonical_benchmark_records_cached.cache_clear()
+    root = tmp_path / "bench"
+    _synthetic_benchmark(root)
+
+    calls = {"count": 0}
+    original_read_jsonl = benchmark_module.read_jsonl
+
+    def counting_read_jsonl(path):
+        calls["count"] += 1
+        return original_read_jsonl(path)
+
+    monkeypatch.setattr(benchmark_module, "read_jsonl", counting_read_jsonl)
+
+    first = benchmark_module.canonical_benchmark_records(root)
+    assert len(first) == 2300
+    assert calls["count"] == 23  # one read per leaf file
+
+    second = benchmark_module.canonical_benchmark_records(root)
+    assert len(second) == 2300
+    assert calls["count"] == 23  # unchanged: served from the process-wide cache
+
+    benchmark_module._canonical_benchmark_records_cached.cache_clear()
+
+
+def test_analyze_and_compare_accept_skip_rescore_without_raising() -> None:
+    import inspect
+
+    from geomapbench_eval.analysis import analyze, compare
+
+    assert "skip_rescore" in inspect.signature(analyze).parameters
+    assert "skip_rescore" in inspect.signature(compare).parameters
+
+
+def test_analyze_skip_rescore_trusts_pre_populated_scores_and_touches_no_gold_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from geomapbench_eval import analysis as analysis_module
+
+    benchmark_root = tmp_path / "bench"
+    _synthetic_benchmark(benchmark_root)
+    results = tmp_path / "condition" / "responses.jsonl"
+    results.parent.mkdir(parents=True)
+    row = {
+        "id": "coordinate_transformation-000", "leaf": "coordinate_transformation",
+        "condition": "base", "model": "m", "status": "ok",
+        "response": '{"answer": "precomputed"}', "task_score": 0.75, "strict_score": 1.0,
+        "parse_error": None, "generation_failure": None, "usage": {}, "retrieval_usage": {},
+        "latency_seconds": 1.0,
+    }
+    results.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    def forbidden_rescore(*args, **kwargs):
+        raise AssertionError("skip_rescore=True must not touch rescore_in_place")
+
+    monkeypatch.setattr(analysis_module, "rescore_in_place", forbidden_rescore)
+
+    summary = analysis_module.analyze(
+        results, tmp_path / "analysis", benchmark_root=benchmark_root, skip_rescore=True,
+    )
+    assert summary["condition_summary"]["base"]["n"] == 1
+    assert summary["condition_summary"]["base"]["task_aware_macro"] == pytest.approx(0.75)
+    assert summary["rescore"]["skipped"] is True

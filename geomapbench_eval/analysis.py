@@ -126,10 +126,18 @@ def analyze(
     *,
     benchmark_root: Path | None = None,
     make_plots: bool = True,
+    skip_rescore: bool = False,
 ) -> dict[str, Any]:
     output.mkdir(parents=True, exist_ok=True)
     benchmark = _resolve_benchmark(results_path, benchmark_root)
-    rescore = rescore_in_place(results_path, benchmark)
+    # Rescoring re-walks every row and, for mask/graph leaves, reopens a gold
+    # asset per row -- real cost against a Drive-mounted benchmark. Skip it
+    # only when the caller already rescored this exact file moments earlier
+    # in the same process; the stored task_score columns are otherwise stale.
+    rescore = {
+        "revision": TASK_METRIC_REVISION, "canonical_rows": None, "rescored_rows": 0,
+        "missing_benchmark_rows": 0, "api_calls": 0, "skipped": True,
+    } if skip_rescore else rescore_in_place(results_path, benchmark)
     benchmark_rows = canonical_benchmark_records(benchmark, prefer_clean=True)
     records = {str(record.get("id")): record for _, record in benchmark_rows}
     rows = [
@@ -249,7 +257,7 @@ def analyze(
     return summary
 
 
-def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
+def compare(base_path: Path, rag_path: Path, output: Path, *, skip_rescore: bool = False) -> dict[str, Any]:
     """Paired, protocol-locked comparison using task-aware and strict scores."""
     fairness_fields = (
         "model", "temperature", "max_tokens", "reasoning_effort", "reasoning_enabled",
@@ -294,15 +302,18 @@ def compare(base_path: Path, rag_path: Path, output: Path) -> dict[str, Any]:
 
     # Standalone comparisons must be just as safe as suite-driven comparisons.
     # Upgrade historical rows from their stored raw responses before reading
-    # task-aware scores; this performs no API/model calls.
-    first_benchmark = Path(str(first_config["benchmark_root"])).expanduser().resolve()
-    second_benchmark = Path(str(second_config["benchmark_root"])).expanduser().resolve()
-    if not first_benchmark.is_dir() and second_benchmark.is_dir():
-        first_benchmark = second_benchmark
-    if not second_benchmark.is_dir() and first_benchmark.is_dir():
-        second_benchmark = first_benchmark
-    rescore_in_place(base_path, first_benchmark)
-    rescore_in_place(rag_path, second_benchmark)
+    # task-aware scores; this performs no API/model calls. Skip only when the
+    # caller already rescored both files moments earlier in the same process
+    # (real Drive I/O cost otherwise, for identical numbers).
+    if not skip_rescore:
+        first_benchmark = Path(str(first_config["benchmark_root"])).expanduser().resolve()
+        second_benchmark = Path(str(second_config["benchmark_root"])).expanduser().resolve()
+        if not first_benchmark.is_dir() and second_benchmark.is_dir():
+            first_benchmark = second_benchmark
+        if not second_benchmark.is_dir() and first_benchmark.is_dir():
+            second_benchmark = first_benchmark
+        rescore_in_place(base_path, first_benchmark)
+        rescore_in_place(rag_path, second_benchmark)
 
     def scored(path: Path) -> dict[str, dict[str, Any]]:
         return {

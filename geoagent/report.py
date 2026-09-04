@@ -62,6 +62,7 @@ def paired_compare(
     output: Path,
     *,
     label: str = "comparison",
+    skip_rescore: bool = False,
 ) -> dict[str, Any]:
     """Protocol-locked paired comparison between any two conditions.
 
@@ -69,6 +70,10 @@ def paired_compare(
     require two retrieval-bearing conditions to share a ``retrieval_config``:
     comparing two *different* retrieval systems is the entire point here, and
     every fairness field that could bias the result is still enforced.
+
+    ``skip_rescore`` skips the (potentially Drive-I/O-heavy) rescore pass when
+    the caller already rescored both files -- or knows they are already
+    correctly scored -- moments earlier in the same process.
     """
     first_config, second_config = _run_config(first_results), _run_config(second_results)
     mismatches = [
@@ -87,14 +92,15 @@ def paired_compare(
             "Runs are not evaluation-protocol compatible; comparison refused.\n - "
             + "\n - ".join(mismatches)
         )
-    first_root = Path(str(first_config["benchmark_root"])).expanduser().resolve()
-    second_root = Path(str(second_config["benchmark_root"])).expanduser().resolve()
-    if not first_root.is_dir() and second_root.is_dir():
-        first_root = second_root
-    if not second_root.is_dir() and first_root.is_dir():
-        second_root = first_root
-    rescore_in_place(Path(first_results), first_root)
-    rescore_in_place(Path(second_results), second_root)
+    if not skip_rescore:
+        first_root = Path(str(first_config["benchmark_root"])).expanduser().resolve()
+        second_root = Path(str(second_config["benchmark_root"])).expanduser().resolve()
+        if not first_root.is_dir() and second_root.is_dir():
+            first_root = second_root
+        if not second_root.is_dir() and first_root.is_dir():
+            second_root = first_root
+        rescore_in_place(Path(first_results), first_root)
+        rescore_in_place(Path(second_results), second_root)
 
     def scored(path: Path) -> dict[str, dict[str, Any]]:
         return {

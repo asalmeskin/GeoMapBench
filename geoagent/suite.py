@@ -22,6 +22,7 @@ from typing import Any
 
 from geomapbench_eval.common import atomic_json
 from geomapbench_eval.experiments import _catalog_check, _model_row, _modality_audit, _trusted_benchmark_report
+from geomapbench_eval.protocol import protocol_descriptor
 from geomapbench_eval.rag import stage_corpus
 
 from . import __version__
@@ -37,6 +38,37 @@ from .retrieval import HybridMultimodalRetriever
 from .taskview import TaskView
 from .tools import propose_answer, run_toolbelt
 from .validate import validate_runtime
+
+
+_SCORING_PROTOCOL_FIELDS = ("scoring_revision", "task_metric_revision", "artifact_protocol_revision")
+
+
+def _already_scored_by_current_code(path: Path) -> bool:
+    """True if a results file's stored task_score values are provably still valid.
+
+    ``rescore_in_place`` re-walks every row and, for mask/graph leaves, reopens
+    a gold asset per row -- real cost against a Drive-mounted benchmark, and
+    pure waste when the file was already scored by this exact scoring code
+    (its producing run's own ``analyze()`` call). Only the scoring-relevant
+    protocol fields matter here; a difference in prompt or retrieval revision
+    does not invalidate a stored score.
+    """
+    config_path = Path(path).parent / "run_config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        stored_protocol = json.loads(config_path.read_text(encoding="utf-8")).get("protocol") or {}
+    except json.JSONDecodeError:
+        return False
+    current_protocol = protocol_descriptor()
+    if any(stored_protocol.get(field) != current_protocol.get(field) for field in _SCORING_PROTOCOL_FIELDS):
+        return False
+    try:
+        rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return False
+    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    return bool(ok_rows) and all(isinstance(row.get("task_score"), (int, float)) for row in ok_rows)
 
 
 def _offline_toolbelt_audit(
@@ -203,7 +235,11 @@ def run_geoagent_suite(args: argparse.Namespace) -> dict[str, Any]:
 
     benchmark_root = Path(args.benchmark_root)
     new_results = condition_dir / "responses.jsonl"
-    analyses = {args.condition: analyze(new_results, condition_dir / "analysis", benchmark_root=benchmark_root)}
+    new_already_scored = _already_scored_by_current_code(new_results)
+    analyses = {args.condition: analyze(
+        new_results, condition_dir / "analysis", benchmark_root=benchmark_root,
+        skip_rescore=new_already_scored,
+    )}
     snapshots: dict[str, Path] = {}
     ablation_root = output / "ablation_inputs"
     if args.base_results and Path(args.base_results).is_file():
@@ -212,15 +248,24 @@ def run_geoagent_suite(args: argparse.Namespace) -> dict[str, Any]:
         previous = Path(args.previous_rag_root or "") / name / "responses.jsonl"
         if previous.is_file():
             snapshots[name] = snapshot_condition(previous, ablation_root / name)
+    already_scored = {"__new__": new_already_scored}
     for name, path in snapshots.items():
-        analyses[name] = analyze(path, path.parent / "analysis", benchmark_root=benchmark_root)
+        already_scored[name] = _already_scored_by_current_code(path)
+        if already_scored[name]:
+            print(f"[geoagent-suite] {name}: already scored by this exact scoring code, skipping rescore", flush=True)
+        analyses[name] = analyze(
+            path, path.parent / "analysis", benchmark_root=benchmark_root, skip_rescore=already_scored[name],
+        )
 
+    # Both sides of every comparison below were just analyzed (or provably
+    # already scored) above; a second rescore inside compare()/paired_compare
+    # would only recompute identical numbers at real Drive I/O cost.
     comparisons: dict[str, Any] = {}
     for name, path in snapshots.items():
         try:
             comparisons[f"{name}_to_{args.condition}"] = paired_compare(
                 path, new_results, output / "comparisons" / f"{name}_to_{args.condition}",
-                label=f"{name} -> {args.condition}",
+                label=f"{name} -> {args.condition}", skip_rescore=True,
             )
         except ValueError as error:
             comparisons[f"{name}_to_{args.condition}"] = {"protocol_validation": "deferred", "reason": str(error)}
@@ -229,6 +274,7 @@ def run_geoagent_suite(args: argparse.Namespace) -> dict[str, Any]:
         try:
             comparisons["official_base_to_geoagent"] = compare(
                 snapshots["base"], new_results, output / "comparisons" / "official_base_to_geoagent",
+                skip_rescore=True,
             )
         except ValueError as error:
             comparisons["official_base_to_geoagent"] = {"protocol_validation": "deferred", "reason": str(error)}
