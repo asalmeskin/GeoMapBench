@@ -20,7 +20,7 @@ from geoagent.suite import _already_scored_by_current_code
 from geoagent.validate import validate_runtime
 from geomapbench_eval.common import atomic_json, read_jsonl
 from geomapbench_eval.cumulative import write_cohort_manifest
-from geomapbench_eval.protocol import protocol_descriptor
+from geomapbench_eval.protocol import protocol_descriptor, protocol_matches_for_resume
 
 
 def _view(leaf, question, payload, choices=None, evaluation_type="exact_match"):
@@ -810,6 +810,89 @@ def test_driver_resumes_for_free_and_recovers_unparsable_answers(
     audit = toolbelt_audit(output / "geoagent_tool_rag" / "agent_trace.jsonl")
     assert audit["records"] == 2
     assert audit["records_with_exact_proposal"] == 2
+
+
+def test_protocol_matches_for_resume_ignores_only_git_provenance() -> None:
+    base = protocol_descriptor()
+    assert protocol_matches_for_resume(base, {**base, "git_commit": "other", "git_dirty": True})
+    for field in (
+        "evaluation_protocol_revision", "package_version", "prompt_revision",
+        "rag_prompt_revision", "multimodal_retrieval_revision", "scoring_revision",
+        "task_metric_revision", "artifact_protocol_revision", "image_converter_revision",
+        "canonical_loader",
+    ):
+        assert not protocol_matches_for_resume(base, {**base, field: "changed"}), field
+
+
+def test_resume_ignores_git_commit_drift_but_still_blocks_semantic_protocol_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `git pull` between two invocations of the same output must not block
+    resuming unless it actually changed a scoring/prompt/retrieval revision."""
+    task_dir = tmp_path / "bench" / "coordinate_transformation"
+    (task_dir / "assets").mkdir(parents=True)
+    (task_dir / "assets" / "000.png").write_bytes(b"png")
+    record = {
+        "id": "coordinate_transformation:000", "leaf": "coordinate_transformation",
+        "input": {
+            "images": ["assets/000.png"],
+            "question": "Transform the coordinate from EPSG:4326 to EPSG:3857.",
+            "source_crs": "EPSG:4326", "target_crs": "EPSG:3857",
+            "coordinate": {"longitude": 2.3522, "latitude": 48.8566,
+                           "axis_order": ["longitude", "latitude"], "unit": "degrees"},
+            "transformation_mode": "geographic_to_web_mercator",
+        },
+        "target": {}, "bloom": {}, "evaluation": {"type": "numeric_coordinate_pair"},
+    }
+    records = [(task_dir, record)]
+    output = tmp_path / "out"
+    cohort_path, _ = write_cohort_manifest(
+        records, target_per_leaf=1, output_root=output, benchmark_content_hash="hash",
+    )
+
+    import geoagent.driver as driver_module
+
+    base_protocol = driver_module.protocol_descriptor()
+
+    def protocol_with(commit: str, **overrides: object) -> dict:
+        return {**base_protocol, "git_commit": commit, "git_dirty": False, **overrides}
+
+    class _AbstainingRetriever:
+        def search_evidence(self, view, *, image_paths, queries, top_k):
+            return [], {"mode": "fake", "text_index_used": False, "image_index_used": False,
+                       "abstained": True, "abstain_reason": "outside_predeclared_corpus_coverage"}
+
+    _stub_openrouter(monkeypatch, [
+        json.dumps({"answer_shape": {"x": "?", "y": "?"}, "shape_note": "x and y",
+                    "queries": [], "pitfalls": []}),
+        '{"answer": {"x": 1.0, "y": 2.0, "axis_order": ["x","y"], "unit": "metres", "crs": "EPSG:3857"}}',
+    ])
+    agent = CachedAgent(model="fake/agent", cache_root=tmp_path / "cache")
+    pipeline = AgenticPipeline(retriever=_AbstainingRetriever(), agent=agent, structured_index=None, top_k=3)
+    config = RunConfig(
+        benchmark_root=tmp_path / "bench", output=output / "geoagent_tool_rag",
+        condition="geoagent_tool_rag", model="fake/answer", max_tokens=16384,
+        temperature=None, max_cost_usd=5.0, progress_every=1, top_k=3,
+        benchmark_content_hash="hash", retrieval_config={"system": "geoagent_v3"},
+    )
+
+    monkeypatch.setattr(driver_module, "protocol_descriptor", lambda: protocol_with("commit-a"))
+    first = run_agentic(config, records=records, cohort_path=cohort_path, pipeline=pipeline, agent=agent)
+    assert first["complete"] is True
+
+    # A different commit hash alone -- an unrelated fix pulled between
+    # invocations -- must not block resuming an already-complete output.
+    monkeypatch.setattr(driver_module, "protocol_descriptor", lambda: protocol_with("commit-b"))
+    resumed = run_agentic(config, records=records, cohort_path=cohort_path, pipeline=pipeline, agent=agent)
+    assert resumed["run_stop_reason"] == "already_complete"
+
+    # An actual semantic protocol change must still be refused.
+    monkeypatch.setattr(
+        driver_module, "protocol_descriptor",
+        lambda: protocol_with("commit-c", scoring_revision="some-other-revision"),
+    )
+    with pytest.raises(ValueError, match="protocol"):
+        run_agentic(config, records=records, cohort_path=cohort_path, pipeline=pipeline, agent=agent)
 
 
 # ---------------------------------------------------------------------------

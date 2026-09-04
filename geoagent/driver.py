@@ -28,7 +28,7 @@ from geomapbench_eval.openrouter import (
     OpenRouterClient, OpenRouterConfig, OpenRouterHTTPError, OpenRouterRetryExhausted,
     finish_reason, generation_failure, response_text,
 )
-from geomapbench_eval.protocol import protocol_descriptor
+from geomapbench_eval.protocol import protocol_descriptor, protocol_matches_for_resume
 
 from . import AGENT_PROMPT_REVISION, AGENT_PROTOCOL_REVISION, REPAIR_REVISION, RETRIEVAL_REVISION
 from .pipeline import AgenticPipeline, stage_summary
@@ -171,12 +171,18 @@ def run_agentic(
         old_ids = set(previous.get("selected_ids") or [])
         if not old_ids.issubset(identity_ids):
             raise ValueError("Cumulative output cannot shrink or replace previously selected IDs")
+        # "protocol" is checked separately via protocol_matches_for_resume,
+        # which ignores git_commit/git_dirty: those record provenance, not a
+        # semantic change, and a resume must not be refused just because an
+        # unrelated commit was pulled between two invocations of this output.
         comparable = (
             "model", "condition", "temperature", "max_tokens", "reasoning_effort",
-            "reasoning_enabled", "top_k", "include_images", "protocol",
+            "reasoning_enabled", "top_k", "include_images",
             "benchmark_content_hash", "cumulative", "retrieval_config", "geoagent",
         )
         changed = [key for key in comparable if previous.get(key) != run_config.get(key)]
+        if not protocol_matches_for_resume(previous.get("protocol") or {}, run_config.get("protocol") or {}):
+            changed.append("protocol")
         if changed:
             raise ValueError(
                 f"Output directory has a different run configuration ({', '.join(changed)}); "

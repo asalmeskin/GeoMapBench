@@ -17,7 +17,7 @@ from .openrouter import (
     response_text,
 )
 from .prompts import build_messages
-from .protocol import protocol_descriptor
+from .protocol import protocol_descriptor, protocol_matches_for_resume
 from .scoring import is_artifact_target
 from .task_metrics import evaluate_task_aware
 
@@ -209,12 +209,18 @@ def run(args: argparse.Namespace, *, retriever: Retriever | None = None) -> dict
             comparable = {
                 "model", "condition", "temperature", "max_tokens",
                 "reasoning_effort", "reasoning_enabled", "top_k",
-                "include_images", "protocol", "benchmark_content_hash", "cumulative",
+                "include_images", "benchmark_content_hash", "cumulative",
                 "retrieval_config",
             }
         else:
-            comparable = set(run_config) - {"created_at"}
+            comparable = set(run_config) - {"created_at", "protocol"}
+        # "protocol" is checked separately via protocol_matches_for_resume,
+        # which ignores git_commit/git_dirty: those record provenance, not a
+        # semantic change, and a resume must not be refused just because an
+        # unrelated commit was pulled between two invocations of this output.
         changed = [key for key in comparable if previous.get(key) != run_config.get(key)]
+        if not protocol_matches_for_resume(previous.get("protocol") or {}, run_config.get("protocol") or {}):
+            changed.append("protocol")
         if changed:
             raise ValueError(
                 f"Output directory has a different run configuration ({', '.join(changed)}); "
