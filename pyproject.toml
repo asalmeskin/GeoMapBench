@@ -37,6 +37,7 @@ test = ["pytest>=8,<9"]
 geomapbench-data = "geomapbench_data.cli:main"
 geomaprag-data = "geomaprag_data.cli:main"
 geomapbench-eval = "geomapbench_eval.cli:main"
+geoagent-eval = "geoagent.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["geomapbench_data*", "geomaprag_data*", "geomapbench_eval*"]
+include = ["geomapbench_data*", "geomaprag_data*", "geomapbench_eval*", "geoagent*"]
